@@ -1,10 +1,16 @@
-// LinkedIn Profile Extractor — Content Script
+// LinkedIn Profile Extractor — Content Script v1.2
 // Supports two modes:
 //   1. MAIN PROFILE  : linkedin.com/in/username
-//   2. DETAIL PAGE   : linkedin.com/in/username/details/certifications/ (and all /details/* sub-pages)
+//   2. DETAIL PAGE   : linkedin.com/in/username/details/* sub-pages
+//
+// FIX: Wrapped in a guard so re-injection doesn't register duplicate listeners.
 
 (function () {
   "use strict";
+
+  // ── Guard against duplicate listener registration on re-inject ──
+  if (window.__linkedinExtractorLoaded) return;
+  window.__linkedinExtractorLoaded = true;
 
   // ─────────────────────────────────────────────────────────
   // URL → section name mapping for /details/* sub-pages
@@ -49,8 +55,21 @@
     return root ? Array.from(root.querySelectorAll(selector)) : [];
   }
 
+  // FIX: Only get direct aria-hidden spans, not deeply nested ones that
+  // belong to child list items — avoids duplicating nested experience roles.
   function getSpans(el) {
-    return getAll(el, "span[aria-hidden='true']")
+    if (!el) return [];
+    // Collect spans but exclude those that are inside a nested list item
+    return Array.from(el.querySelectorAll("span[aria-hidden='true']"))
+      .filter((s) => {
+        // Exclude if this span lives inside a nested <li> that is a descendant of el
+        let parent = s.parentElement;
+        while (parent && parent !== el) {
+          if (parent.tagName === "LI" && parent !== el) return false;
+          parent = parent.parentElement;
+        }
+        return true;
+      })
       .map((s) => clean(s.innerText))
       .filter((s) => s && s !== "·" && s !== "•" && s !== "|");
   }
@@ -167,7 +186,7 @@
     const spans = getSpans(item);
     const datePattern = /([A-Z][a-z]{2,9}\.?\s+\d{4}|Present)\s*[–\-—]\s*([A-Z][a-z]{2,9}\.?\s+\d{4}|Present)/;
     const yearPattern  = /\d{4}\s*[–\-—]\s*(\d{4}|Present)/;
-    const durationPattern = /\d+\s*(yr|mo|yr|mos)/i;
+    const durationPattern = /\d+\s*(yr|yrs|mo|mos)/i;
 
     let duration = "", durationLen = "";
     for (const s of spans) {
@@ -199,7 +218,13 @@
     root = root || findSectionByHeading("experience");
     if (!root) return [];
     const entries = [];
-    for (const item of getAll(root, "li.artdeco-list__item")) {
+    // FIX: Only get top-level list items, not nested ones inside sub-lists.
+    const topLevelItems = Array.from(root.querySelectorAll("li.artdeco-list__item")).filter((li) => {
+      // Exclude if this li is nested inside another li that is also artdeco-list__item
+      return !li.parentElement?.closest("li.artdeco-list__item");
+    });
+
+    for (const item of topLevelItems) {
       const nested = getAll(item, ".pvs-entity--with-path li.artdeco-list__item");
       if (nested.length > 0) {
         const companyEl = item.querySelector(".t-16.t-black.t-bold span[aria-hidden='true'], .t-bold span[aria-hidden='true']");
@@ -224,6 +249,7 @@
     root = root || findSectionByHeading("education");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const spans = getSpans(item);
         const yearPat = /\d{4}\s*[–\-—]\s*(\d{4}|Present)/;
@@ -255,18 +281,20 @@
     if (!root) return [];
     const seen = new Set();
     const skills = [];
-    getAll(root, "li.artdeco-list__item").forEach((item) => {
-      const nameEl =
-        item.querySelector(".t-bold span[aria-hidden='true']") ||
-        item.querySelector(".t-16 span[aria-hidden='true']");
-      const name = nameEl ? clean(nameEl.innerText) : "";
-      if (!name || seen.has(name)) return;
-      seen.add(name);
-      const subSpans = getSpans(item).filter((s) => s !== name);
-      const endorseText = subSpans.find((s) => /endorsement|people/i.test(s)) || "";
-      const category    = subSpans.find((s) => !/endorsement|people/i.test(s) && s.length < 60) || "";
-      skills.push({ name, category, endorsements: endorseText });
-    });
+    getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
+      .forEach((item) => {
+        const nameEl =
+          item.querySelector(".t-bold span[aria-hidden='true']") ||
+          item.querySelector(".t-16 span[aria-hidden='true']");
+        const name = nameEl ? clean(nameEl.innerText) : "";
+        if (!name || seen.has(name)) return;
+        seen.add(name);
+        const subSpans = getSpans(item).filter((s) => s !== name);
+        const endorseText = subSpans.find((s) => /endorsement|people/i.test(s)) || "";
+        const category    = subSpans.find((s) => !/endorsement|people/i.test(s) && s.length < 60) || "";
+        skills.push({ name, category, endorsements: endorseText });
+      });
     return skills;
   }
 
@@ -280,6 +308,7 @@
       findSectionByHeading("certifications");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const spans = getSpans(item);
         let issued = "", expiry = "", credentialId = "";
@@ -307,6 +336,7 @@
     root = root || findSectionByHeading("projects");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const spans = getSpans(item);
         const datePat = /([A-Z][a-z]{2,9}\.?\s+\d{4}|Present)\s*[–\-—]/;
@@ -338,6 +368,7 @@
       findSectionByHeading("volunteering");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const spans = getSpans(item);
         const datePat = /([A-Z][a-z]{2,9}\.?\s+\d{4}|Present)\s*[–\-—]/;
@@ -367,6 +398,7 @@
     root = root || findSectionByHeading("languages");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const spans = getSpans(item);
         return { language: spans[0] || "", proficiency: spans[1] || "" };
@@ -384,6 +416,7 @@
       findSectionByHeading("honors");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const spans = getSpans(item);
         const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
@@ -405,6 +438,7 @@
     root = root || findSectionByHeading("publications");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const spans = getSpans(item);
         const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
@@ -428,6 +462,7 @@
     root = root || findSectionByHeading("courses");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const spans = getSpans(item);
         return { name: spans[0] || "", number: spans[1] || "" };
@@ -443,6 +478,7 @@
     root = root || findSectionByHeading("recommendations");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const nameEl = item.querySelector(".t-bold span[aria-hidden='true'], .t-16 span[aria-hidden='true']");
         const roleEl = item.querySelector(".t-14.t-normal span[aria-hidden='true']");
@@ -466,10 +502,16 @@
     root = root || findSectionByHeading("organizations");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const spans = getSpans(item);
         const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
-        return { name: spans[0] || "", role: spans[1] || "", duration: spans[2] || "", description: descEl ? clean(descEl.innerText) : "" };
+        return {
+          name:        spans[0] || "",
+          role:        spans[1] || "",
+          duration:    spans[2] || "",
+          description: descEl ? clean(descEl.innerText) : "",
+        };
       })
       .filter((e) => e.name);
   }
@@ -482,10 +524,17 @@
     root = root || findSectionByHeading("patents");
     if (!root) return [];
     return getAll(root, "li.artdeco-list__item")
+      .filter((li) => !li.parentElement?.closest("li.artdeco-list__item"))
       .map((item) => {
         const spans = getSpans(item);
         const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
-        return { title: spans[0] || "", status: spans[1] || "", number: spans[2] || "", date: spans[3] || "", description: descEl ? clean(descEl.innerText) : "" };
+        return {
+          title:       spans[0] || "",
+          status:      spans[1] || "",
+          number:      spans[2] || "",
+          date:        spans[3] || "",
+          description: descEl ? clean(descEl.innerText) : "",
+        };
       })
       .filter((e) => e.title);
   }
@@ -524,17 +573,17 @@
     if (profile.about) { lines.push(heading("About")); lines.push(`  ${profile.about}`); }
 
     const sections = [
-      ["experience",      `Experience`,                  (e, i) => { lines.push(subHeading(`Role ${i+1}`)); f("Title",e.title);f("Company",e.company);f("Duration",e.duration);f("Location",e.location);f("Description",e.description); }],
-      ["education",       `Education`,                   (e, i) => { lines.push(subHeading(`Entry ${i+1}`)); f("School",e.school);f("Degree",e.degree);f("Field",e.field);f("Duration",e.duration);f("Grade",e.grade);f("Activities",e.activities);f("Description",e.description); }],
-      ["skills",          `Skills`,                      (e)    => { const x=[e.category,e.endorsements].filter(Boolean).join(" · "); lines.push(`  • ${e.name}${x?`  [${x}]`:""}`); }],
-      ["certifications",  `Licenses & Certifications`,   (e, i) => { lines.push(subHeading(`Cert ${i+1}`)); f("Name",e.name);f("Issuer",e.issuer);f("Issued",e.issued);f("Expires",e.expiry);f("Credential ID",e.credentialId);f("URL",e.url); }],
-      ["projects",        `Projects`,                    (e, i) => { lines.push(subHeading(`Project ${i+1}`)); f("Name",e.name);f("Association",e.association);f("Duration",e.duration);f("Description",e.description);f("URL",e.url); }],
-      ["volunteering",    `Volunteer Experience`,        (e, i) => { lines.push(subHeading(`Entry ${i+1}`)); f("Role",e.role);f("Organization",e.organization);f("Duration",e.duration);f("Cause",e.cause);f("Description",e.description); }],
-      ["languages",       `Languages`,                   (e)    => { lines.push(`  • ${e.language}${e.proficiency ? ` — ${e.proficiency}` : ""}`); }],
-      ["honors",          `Honors & Awards`,             (e, i) => { lines.push(subHeading(`Award ${i+1}`)); f("Title",e.title);f("Issuer",e.issuer);f("Date",e.date);f("Description",e.description); }],
-      ["publications",    `Publications`,                (e, i) => { lines.push(subHeading(`Pub ${i+1}`)); f("Title",e.title);f("Publisher",e.publisher);f("Date",e.date);f("Description",e.description);f("URL",e.url); }],
-      ["courses",         `Courses`,                     (e)    => { lines.push(`  • ${e.name}${e.number ? ` [${e.number}]` : ""}`); }],
-      ["recommendations", `Recommendations`,             (e, i) => { lines.push(subHeading(`Rec ${i+1}`)); f("From",e.from);f("Their Role",e.role); if(e.text){lines.push(`  Text:`);lines.push(`    "${e.text}"`);} }],
+      ["experience",      "Experience",                  (e, i) => { lines.push(subHeading(`Role ${i+1}`)); f("Title",e.title);f("Company",e.company);f("Duration",e.duration);f("Location",e.location);f("Description",e.description); }],
+      ["education",       "Education",                   (e, i) => { lines.push(subHeading(`Entry ${i+1}`)); f("School",e.school);f("Degree",e.degree);f("Field",e.field);f("Duration",e.duration);f("Grade",e.grade);f("Activities",e.activities);f("Description",e.description); }],
+      ["skills",          "Skills",                      (e)    => { const x=[e.category,e.endorsements].filter(Boolean).join(" · "); lines.push(`  • ${e.name}${x?`  [${x}]`:""}`); }],
+      ["certifications",  "Licenses & Certifications",   (e, i) => { lines.push(subHeading(`Cert ${i+1}`)); f("Name",e.name);f("Issuer",e.issuer);f("Issued",e.issued);f("Expires",e.expiry);f("Credential ID",e.credentialId);f("URL",e.url); }],
+      ["projects",        "Projects",                    (e, i) => { lines.push(subHeading(`Project ${i+1}`)); f("Name",e.name);f("Association",e.association);f("Duration",e.duration);f("Description",e.description);f("URL",e.url); }],
+      ["volunteering",    "Volunteer Experience",        (e, i) => { lines.push(subHeading(`Entry ${i+1}`)); f("Role",e.role);f("Organization",e.organization);f("Duration",e.duration);f("Cause",e.cause);f("Description",e.description); }],
+      ["languages",       "Languages",                   (e)    => { lines.push(`  • ${e.language}${e.proficiency ? ` — ${e.proficiency}` : ""}`); }],
+      ["honors",          "Honors & Awards",             (e, i) => { lines.push(subHeading(`Award ${i+1}`)); f("Title",e.title);f("Issuer",e.issuer);f("Date",e.date);f("Description",e.description); }],
+      ["publications",    "Publications",                (e, i) => { lines.push(subHeading(`Pub ${i+1}`)); f("Title",e.title);f("Publisher",e.publisher);f("Date",e.date);f("Description",e.description);f("URL",e.url); }],
+      ["courses",         "Courses",                     (e)    => { lines.push(`  • ${e.name}${e.number ? ` [${e.number}]` : ""}`); }],
+      ["recommendations", "Recommendations",             (e, i) => { lines.push(subHeading(`Rec ${i+1}`)); f("From",e.from);f("Their Role",e.role); if(e.text){lines.push(`  Text:`);lines.push(`    "${e.text}"`);} }],
     ];
 
     for (const [key, label, renderer] of sections) {
@@ -550,7 +599,8 @@
 
   function formatDetailSection(sectionName, data, profileName) {
     const lines = [];
-    lines.push(DIV,
+    lines.push(
+      DIV,
       `  LINKEDIN — ${sectionName.toUpperCase()}`,
       profileName ? `  Profile   : ${profileName}` : null,
       `  Extracted : ${new Date().toLocaleString()}`,
@@ -640,10 +690,10 @@
   }
 
   // ─────────────────────────────────────────────────────────
-  // MESSAGE LISTENERS
+  // MESSAGE LISTENER
   // ─────────────────────────────────────────────────────────
 
-  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     if (request.action === "detectMode") {
       sendResponse({ success: true, data: detectMode() });
       return true;

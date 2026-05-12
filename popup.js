@@ -1,28 +1,38 @@
-// LinkedIn Extractor — Popup Script v1.1
+// LinkedIn Extractor — Popup Script v1.2
 // Detects whether user is on a main profile or a /details/* sub-page
 // and adapts the UI and extraction accordingly.
+// Changes from v1.1:
+//   - No file download; extracted text shown in inline results panel
+//   - Fixed: setLoading(false) in finally no longer clobbers "RETRY" text
+//   - Fixed: null guard on modeData.section before .charAt()
+//   - Fixed: null guard on tab before accessing tab.id
+//   - Fixed: sendToContent delay to let re-injected script register its listener
+//   - Fixed: textContent used instead of innerHTML for copy button reset
 
 // ─────────────────────────────────────────────
 // ELEMENT REFS
 // ─────────────────────────────────────────────
 
-const $modeBadge  = document.getElementById("modeBadge");
-const $modeIcon   = document.getElementById("modeIcon");
-const $modeLabel  = document.getElementById("modeLabel");
-const $modeSub    = document.getElementById("modeSub");
-const $chipsWrap  = document.getElementById("chipsWrap");
-const $chipsGrid  = document.getElementById("chipsGrid");
-const $tip        = document.getElementById("tip");
-const $extractBtn = document.getElementById("extractBtn");
-const $btnIcon    = document.getElementById("btnIcon");
-const $btnText    = document.getElementById("btnText");
-const $spinner    = document.getElementById("spinner");
-const $previewBtn = document.getElementById("previewBtn");
-const $copyBtn    = document.getElementById("copyBtn");
-const $footerTip  = document.getElementById("footerTip");
+const $modeBadge    = document.getElementById("modeBadge");
+const $modeIcon     = document.getElementById("modeIcon");
+const $modeLabel    = document.getElementById("modeLabel");
+const $modeSub      = document.getElementById("modeSub");
+const $chipsWrap    = document.getElementById("chipsWrap");
+const $chipsGrid    = document.getElementById("chipsGrid");
+const $tip          = document.getElementById("tip");
+const $extractBtn   = document.getElementById("extractBtn");
+const $btnIcon      = document.getElementById("btnIcon");
+const $btnText      = document.getElementById("btnText");
+const $spinner      = document.getElementById("spinner");
+const $resultsPanel = document.getElementById("resultsPanel");
+const $resultsPre   = document.getElementById("resultsPre");
+const $copyAllBtn   = document.getElementById("copyAllBtn");
+const $clearBtn     = document.getElementById("clearBtn");
+const $footerTip    = document.getElementById("footerTip");
 
-let lastFormatted = "";
-let currentMode   = "unknown"; // "main" | "detail" | "unknown"
+let lastFormatted  = "";
+let currentMode    = "unknown"; // "main" | "detail" | "unknown"
+let extractionDone = false;     // true once we have a successful result
 
 // ─────────────────────────────────────────────
 // SECTION LABELS FOR CHIP DISPLAY
@@ -38,13 +48,19 @@ const SECTION_KEYS = [
 // UI HELPERS
 // ─────────────────────────────────────────────
 
+// FIX: extractionDone flag ensures setLoading(false) never overwrites
+// the "RETRY" label set in the catch block.
 function setLoading(yes) {
   $spinner.classList.toggle("visible", yes);
   $btnIcon.style.display = yes ? "none" : "inline";
   $extractBtn.disabled = yes;
-  $btnText.textContent  = yes ? "EXTRACTING…" : (
-    currentMode === "detail" ? "EXTRACT THIS SECTION" : "EXTRACT & DOWNLOAD"
-  );
+  if (yes) {
+    $btnText.textContent = "EXTRACTING…";
+  } else if (!extractionDone) {
+    // Only reset to default label when we haven't completed an extraction yet
+    $btnText.textContent = currentMode === "detail" ? "EXTRACT THIS SECTION" : "EXTRACT";
+  }
+  // If extractionDone is true, the button already says "EXTRACT AGAIN" or "RETRY" — leave it.
 }
 
 function flashSuccess() {
@@ -65,60 +81,19 @@ function renderChips(profile) {
   $chipsWrap.classList.add("visible");
 }
 
-// ─────────────────────────────────────────────
-// FILE DOWNLOAD
-// ─────────────────────────────────────────────
-
-function downloadTxt(text, filename) {
-  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement("a");
-  a.href = url; a.download = filename; a.click();
-  URL.revokeObjectURL(url);
+function showResults(text) {
+  $resultsPre.textContent = text;
+  $resultsPanel.classList.add("visible");
+  // Scroll the pre to top
+  $resultsPre.scrollTop = 0;
 }
 
-function makeFilename(result) {
-  const date = new Date().toISOString().slice(0, 10);
-
-  if (result.mode === "detail") {
-    // e.g. "certifications_2026-02-24.txt"
-    return `${result.section}_${date}.txt`;
-  }
-
-  // main profile — use person's name
-  const name = (result.profile?.header?.name || "linkedin-profile")
-    .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return `${name}_${date}.txt`;
-}
-
-// ─────────────────────────────────────────────
-// PREVIEW MODAL
-// ─────────────────────────────────────────────
-
-function showPreview(text) {
-  document.getElementById("previewModal")?.remove();
-
-  const modal = document.createElement("div");
-  modal.id = "previewModal";
-  modal.style.cssText = "position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.88);display:flex;flex-direction:column;backdrop-filter:blur(4px)";
-
-  const box = document.createElement("div");
-  box.style.cssText = "background:#0a0a0f;border:1px solid #1e1e2e;border-radius:10px;margin:12px;display:flex;flex-direction:column;flex:1;overflow:hidden";
-
-  const hdr = document.createElement("div");
-  hdr.style.cssText = "padding:9px 13px;border-bottom:1px solid #1e1e2e;display:flex;align-items:center;justify-content:space-between;font-family:'Space Mono',monospace;font-size:10px;color:#6e6e8a";
-  hdr.innerHTML = `<span>PREVIEW</span><button id="closeP" style="background:none;border:none;color:#6e6e8a;cursor:pointer;font-size:15px">✕</button>`;
-
-  const pre = document.createElement("pre");
-  pre.textContent = text;
-  pre.style.cssText = "flex:1;overflow:auto;padding:11px 13px;font-family:'Space Mono',monospace;font-size:8.5px;color:#e8e8f0;line-height:1.6;white-space:pre-wrap;word-break:break-word";
-
-  box.appendChild(hdr); box.appendChild(pre);
-  modal.appendChild(box);
-  document.body.appendChild(modal);
-
-  document.getElementById("closeP").onclick = () => modal.remove();
-  modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+function hideResults() {
+  $resultsPanel.classList.remove("visible");
+  $resultsPre.textContent = "";
+  $chipsWrap.classList.remove("visible");
+  lastFormatted = "";
+  extractionDone = false;
 }
 
 // ─────────────────────────────────────────────
@@ -126,15 +101,24 @@ function showPreview(text) {
 // ─────────────────────────────────────────────
 
 async function sendToContent(tabId, action) {
-  // Always re-inject to make sure the latest script is running
+  // Re-inject so we always have the latest script version running.
   try {
     await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
-  } catch (_) { /* already injected or CSP issue — proceed anyway */ }
+  } catch (_) {
+    // Already injected or CSP issue — proceed anyway.
+  }
+
+  // FIX: Small delay so the freshly injected script has time to register
+  // its chrome.runtime.onMessage listener before we send the message.
+  await new Promise((r) => setTimeout(r, 80));
 
   return new Promise((resolve, reject) => {
     chrome.tabs.sendMessage(tabId, { action }, (res) => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve(res);
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(res);
+      }
     });
   });
 }
@@ -149,7 +133,7 @@ async function detectAndUpdateUI() {
 
   // Not on LinkedIn at all
   if (!url.includes("linkedin.com/in/")) {
-    $modeBadge.className = "mode-badge mode-unknown";
+    $modeBadge.className   = "mode-badge mode-unknown";
     $modeIcon.textContent  = "🔗";
     $modeLabel.textContent = "Not a LinkedIn Profile";
     $modeSub.textContent   = "Navigate to linkedin.com/in/someone";
@@ -163,8 +147,11 @@ async function detectAndUpdateUI() {
   // Ask content script for the mode (it knows the exact URL structure)
   let modeData = { mode: "unknown" };
   try {
-    const res = await sendToContent(tab.id, "detectMode");
-    if (res?.success) modeData = res.data;
+    // FIX: guard against tab being undefined
+    if (tab?.id != null) {
+      const res = await sendToContent(tab.id, "detectMode");
+      if (res?.success) modeData = res.data;
+    }
   } catch (_) {}
 
   currentMode = modeData.mode;
@@ -176,12 +163,14 @@ async function detectAndUpdateUI() {
     $modeSub.textContent   = "Will extract all sections visible on the page";
     $extractBtn.disabled   = false;
     $extractBtn.className  = "extract-btn";
-    $btnText.textContent   = "EXTRACT & DOWNLOAD";
+    $btnText.textContent   = "EXTRACT";
     $tip.classList.add("visible");
     $footerTip.innerHTML   = `Tip: scroll the page + click <span>Show all</span> first`;
 
   } else if (modeData.mode === "detail") {
-    const sectionName = modeData.section.charAt(0).toUpperCase() + modeData.section.slice(1);
+    // FIX: guard modeData.section before calling .charAt()
+    const rawSection  = modeData.section || "section";
+    const sectionName = rawSection.charAt(0).toUpperCase() + rawSection.slice(1);
     $modeBadge.className   = "mode-badge mode-detail";
     $modeIcon.textContent  = "📋";
     $modeLabel.textContent = `Detail Page — ${sectionName}`;
@@ -207,29 +196,33 @@ async function detectAndUpdateUI() {
 // ─────────────────────────────────────────────
 
 async function doExtract() {
+  extractionDone = false;
   setLoading(true);
   $modeLabel.textContent = "Extracting…";
   $modeSub.textContent   = "Reading the page, please wait";
+  hideResults();
 
   try {
+    // FIX: guard against tab being undefined/null
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const res   = await sendToContent(tab.id, "extract");
+    if (!tab?.id) throw new Error("Could not access the active tab.");
 
-    if (!res?.success) throw new Error(res?.error || "Unknown error");
+    const res = await sendToContent(tab.id, "extract");
 
-    const result = res.data;
-    lastFormatted = result.formatted;
+    if (!res?.success) throw new Error(res?.error || "Unknown error from content script");
 
-    // Download the file
-    downloadTxt(result.formatted, makeFilename(result));
+    const result  = res.data;
+    lastFormatted = result.formatted || "";
 
-    // Update UI
+    // Show extracted text in the results panel
+    showResults(lastFormatted);
+
+    // Update status UI
     if (result.mode === "main") {
       const name = result.profile?.header?.name || "Profile";
       $modeLabel.textContent = `✓ Extracted: ${name}`;
-      $modeSub.textContent   = "File downloaded successfully";
+      $modeSub.textContent   = "Ready to copy";
       renderChips(result.profile);
-      // Count non-empty sections
       const filled = SECTION_KEYS.filter((k) => {
         const d = result.profile[k];
         return Array.isArray(d) ? d.length > 0 : !!d;
@@ -237,46 +230,68 @@ async function doExtract() {
       $footerTip.innerHTML = `<span>${filled}</span> sections found`;
 
     } else if (result.mode === "detail") {
-      const sectionName = result.section.charAt(0).toUpperCase() + result.section.slice(1);
+      const rawSection  = result.section || "section";
+      const sectionName = rawSection.charAt(0).toUpperCase() + rawSection.slice(1);
       $modeLabel.textContent = `✓ ${sectionName}: ${result.count} entries`;
-      $modeSub.textContent   = "File downloaded successfully";
+      $modeSub.textContent   = "Ready to copy";
       $footerTip.innerHTML   = `<span>${result.count}</span> entries extracted`;
     }
 
     flashSuccess();
-    $btnIcon.textContent = "✓";
+    extractionDone = true;
+    $btnIcon.textContent = "↺";
     $btnText.textContent = "EXTRACT AGAIN";
-    $previewBtn.classList.add("visible");
-    $copyBtn.classList.add("visible");
 
   } catch (err) {
     console.error("[LinkedIn Extractor]", err);
     $modeBadge.className   = "mode-badge mode-unknown";
     $modeLabel.textContent = "Extraction Failed";
     $modeSub.textContent   = err.message || "Reload the page and try again";
-    $btnIcon.textContent   = "⬇";
-    $btnText.textContent   = "RETRY";
+    // FIX: set extractionDone to true so setLoading(false) won't clobber these labels
+    extractionDone = true;
+    $btnIcon.textContent = "⬇";
+    $btnText.textContent = "RETRY";
   } finally {
     setLoading(false);
   }
 }
 
 // ─────────────────────────────────────────────
-// EVENTS
+// COPY ALL
+// ─────────────────────────────────────────────
+
+$copyAllBtn.addEventListener("click", async () => {
+  if (!lastFormatted) return;
+  try {
+    await navigator.clipboard.writeText(lastFormatted);
+    $copyAllBtn.textContent = "✓ Copied!";
+    $copyAllBtn.classList.add("copied");
+    setTimeout(() => {
+      // FIX: use textContent, not innerHTML
+      $copyAllBtn.textContent = "📋 Copy All";
+      $copyAllBtn.classList.remove("copied");
+    }, 2000);
+  } catch (e) {
+    $copyAllBtn.textContent = "⚠ Failed";
+    setTimeout(() => { $copyAllBtn.textContent = "📋 Copy All"; }, 2000);
+  }
+});
+
+// ─────────────────────────────────────────────
+// CLEAR
+// ─────────────────────────────────────────────
+
+$clearBtn.addEventListener("click", () => {
+  hideResults();
+  // Reset status back to mode detection
+  detectAndUpdateUI();
+});
+
+// ─────────────────────────────────────────────
+// EXTRACT BUTTON
 // ─────────────────────────────────────────────
 
 $extractBtn.addEventListener("click", doExtract);
-
-$previewBtn.addEventListener("click", () => {
-  if (lastFormatted) showPreview(lastFormatted);
-});
-
-$copyBtn.addEventListener("click", async () => {
-  if (!lastFormatted) return;
-  await navigator.clipboard.writeText(lastFormatted);
-  $copyBtn.innerHTML = "✓ Copied!";
-  setTimeout(() => { $copyBtn.innerHTML = "📋 Copy"; }, 2000);
-});
 
 // ─────────────────────────────────────────────
 // INIT
