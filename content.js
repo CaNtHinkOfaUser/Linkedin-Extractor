@@ -1,17 +1,21 @@
-// LinkedIn Profile Extractor — Content Script v1.4
-// Key design changes from previous versions:
-//   - Removed __linkedinExtractorLoaded guard (broke SPA navigation)
-//   - Instead, remove old listener before adding new one via a named handler ref
-//   - Detail page root is now scoped to the actual list, not entire <main>
-//   - Broader item selectors handle 2024/2025 LinkedIn DOM variants
-//   - Debug helper: open DevTools console and run window.__liDebug()
+// LinkedIn Profile Extractor — Content Script v1.5
+// v1.5 changes:
+//   - Completely rewritten getDetailRoot(): DOM-tree search for largest <ul>
+//     rather than relying on class names that LinkedIn changes frequently
+//   - getItems(): added 8 new selector variants + plain-li fallback with
+//     smarter nesting filter
+//   - getSpans(): added innerText fallback when aria-hidden yields nothing;
+//     now also scrapes .visually-hidden-free text
+//   - getText(): new universal text extractor used as last resort
+//   - extractCertifications(): extra field patterns for modern LinkedIn layout
+//   - All extractors: call getText() fallback if getSpans() is empty
+//   - Debug dump now prints outerHTML of root + first 3 items
 
 (function () {
   "use strict";
 
   // ─────────────────────────────────────────────────────────
   // LISTENER DE-DUPLICATION
-  // Store the handler on window so re-injection removes the old one first.
   // ─────────────────────────────────────────────────────────
   if (window.__liExtractHandler) {
     try { chrome.runtime.onMessage.removeListener(window.__liExtractHandler); } catch (_) {}
@@ -51,12 +55,52 @@
   function q(root, sel)  { return (root || document).querySelector(sel); }
   function qa(root, sel) { return Array.from((root || document).querySelectorAll(sel)); }
 
-  // Collect aria-hidden span texts from el, but NOT from spans that live
-  // inside a nested <li> (avoids absorbing child entries' text).
+  // ── Universal text extractor ──────────────────────────────
+  // Gets all meaningful text from an element, excluding screen-reader-only
+  // text (.visually-hidden) and deeply nested sub-entries (<li> descendants).
+  function getText(el, stopAtNestedLi = true) {
+    if (!el) return [];
+    const walker = document.createTreeWalker(
+      el,
+      NodeFilter.SHOW_TEXT,
+      {
+        acceptNode(node) {
+          const p = node.parentElement;
+          if (!p) return NodeFilter.FILTER_REJECT;
+          // Skip visually hidden (screen-reader-only) text
+          const cls = p.className || "";
+          if (typeof cls === "string" && cls.includes("visually-hidden")) return NodeFilter.FILTER_REJECT;
+          if (typeof cls === "string" && cls.includes("sr-only"))         return NodeFilter.FILTER_REJECT;
+          // Skip text inside nested <li> (child entries)
+          if (stopAtNestedLi) {
+            let cur = p;
+            while (cur && cur !== el) {
+              if (cur.tagName === "LI" && cur !== el) return NodeFilter.FILTER_REJECT;
+              cur = cur.parentElement;
+            }
+          }
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      }
+    );
+    const texts = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      const t = clean(node.nodeValue);
+      if (t && t !== "·" && t !== "•" && t !== "|" && t !== "–" && t !== "-" && t.length > 1) {
+        texts.push(t);
+      }
+    }
+    // Deduplicate adjacent identical strings
+    return texts.filter((t, i) => t !== texts[i - 1]);
+  }
+
+  // ── Aria-hidden span collector (primary method) ───────────
   function getSpans(el) {
     if (!el) return [];
-    return qa(el, "span[aria-hidden='true']")
+    const spans = qa(el, "span[aria-hidden='true']")
       .filter(s => {
+        // Must not be inside a nested <li>
         let cur = s.parentElement;
         while (cur && cur !== el) {
           if (cur.tagName === "LI") return false;
@@ -65,10 +109,14 @@
         return true;
       })
       .map(s => clean(s.innerText || s.textContent))
-      .filter(s => s && s !== "·" && s !== "•" && s !== "|" && s !== "–" && s !== "-");
+      .filter(s => s && s !== "·" && s !== "•" && s !== "|" && s !== "–" && s !== "-" && s.length > 0);
+
+    if (spans.length > 0) return spans;
+
+    // Fallback: use universal text extractor if aria-hidden yields nothing
+    return getText(el);
   }
 
-  // Try several selectors in order; return first non-empty text found.
   function firstText(root, ...sels) {
     for (const sel of sels) {
       const el = q(root, sel);
@@ -93,17 +141,22 @@
   }
 
   // ─────────────────────────────────────────────────────────
-  // ITEM COLLECTION
-  // LinkedIn has changed class names several times across redesigns.
-  // We try a priority list; take the first selector that yields top-level items.
-  // "Top-level" = not nested inside another element matching the same selector.
+  // ITEM COLLECTION — tries many selectors, newest LinkedIn first
   // ─────────────────────────────────────────────────────────
   const ITEM_SELS = [
-    "li.artdeco-list__item",
+    // 2024-2025 variants
     "li.pvs-list__item--line-separated",
     "li.pvs-list__item--with-top-padding",
+    "li[class*='pvs-list__item--line-separated']",
+    "li[class*='pvs-list__item--with-top-padding']",
     "li[class*='pvs-list__item']",
+    // artdeco (older but still used in some views)
+    "li.artdeco-list__item",
+    "li[class*='artdeco-list__item']",
+    // data attribute variants
     "li[data-view-name]",
+    "li[data-occludable-item-index]",
+    // last-resort: any li
     "li",
   ];
 
@@ -112,63 +165,102 @@
     for (const sel of ITEM_SELS) {
       const all = qa(root, sel);
       if (!all.length) continue;
-      // Keep only items not nested inside another item of the same type.
+      // Keep only top-level items (not nested inside another matched item)
       const top = all.filter(li => {
-        const parentMatch = li.parentElement?.closest(sel);
-        return !parentMatch || parentMatch === root;
+        let cur = li.parentElement;
+        while (cur && cur !== root) {
+          if (cur.matches && cur.matches(sel) && cur !== li) return false;
+          cur = cur.parentElement;
+        }
+        return true;
       });
-      if (top.length) return top;
+      if (top.length > 0) return top;
     }
     return [];
   }
 
   // ─────────────────────────────────────────────────────────
-  // ROOT FINDERS
+  // ROOT FINDERS — rewritten for DOM-tree robustness
   // ─────────────────────────────────────────────────────────
 
-  // For detail pages: scope to the scrollable list container, NOT all of <main>.
-  // Grabbing all of <main> matches sidebar/nav items too — that's why 0 entries.
+  // Scores a candidate root element: higher = better list container
+  function scoreRoot(el) {
+    if (!el) return -1;
+    const liCount = qa(el, "li").length;
+    if (liCount === 0) return -1;
+
+    let score = liCount * 10;
+
+    // Bonus for known good class fragments
+    const cls = (el.className || "").toString();
+    if (cls.includes("scaffold-finite-scroll"))    score += 200;
+    if (cls.includes("pvs-list"))                  score += 150;
+    if (cls.includes("profile-detail"))            score += 100;
+    if (cls.includes("artdeco-list"))              score += 80;
+    if (el.tagName === "UL")                       score += 50;
+    if (el.tagName === "SECTION")                  score += 30;
+
+    // Penalty if it's the entire body/main (too broad)
+    if (el === document.body || el.tagName === "BODY") score -= 500;
+
+    // Penalty for nav/header elements
+    const tag = el.tagName;
+    if (tag === "NAV" || tag === "HEADER" || tag === "FOOTER") score -= 300;
+    if (cls.includes("nav") || cls.includes("header"))         score -= 200;
+
+    return score;
+  }
+
   function getDetailRoot() {
-    const candidates = [
-      // Most specific: the finite scroll content area
+    const main = q(document, "main") || document.body;
+
+    // 1. Try explicit known selectors first (fast path)
+    const explicit = [
       "main .scaffold-finite-scroll__content",
-      // Profile detail view wrapper
       "main [data-view-name='profile-detail-view']",
-      // A <ul> directly inside main with pvs-list class
       "main ul.pvs-list",
-      // Any pvs-list inside main
       "main .pvs-list",
-      // Fallback: main itself
-      "main",
+      "main section ul",
+      "main ul",
     ];
-    for (const sel of candidates) {
+    for (const sel of explicit) {
       const el = q(document, sel);
       if (el && qa(el, "li").length > 0) return el;
     }
-    return document.body;
+
+    // 2. Walk all descendants of <main> and pick the highest-scoring one
+    const allEls = Array.from(main.querySelectorAll("*"));
+    let best = main, bestScore = scoreRoot(main);
+    for (const el of allEls) {
+      const s = scoreRoot(el);
+      if (s > bestScore) { best = el; bestScore = s; }
+    }
+
+    return best;
   }
 
   // For main profile: find the <section> whose heading matches a keyword.
   function findSection(keyword) {
     const kw = keyword.toLowerCase();
-    // 1. aria-label
     for (const sec of qa(document, "section")) {
       if ((sec.getAttribute("aria-label") || "").toLowerCase().includes(kw)) return sec;
     }
-    // 2. h2 text
     for (const sec of qa(document, "section")) {
       const h2 = q(sec, "h2");
       if (h2 && clean(h2.innerText).toLowerCase().includes(kw)) return sec;
     }
-    // 3. data-section attribute
     for (const sec of qa(document, "section")) {
       if ((sec.getAttribute("data-section") || "").toLowerCase().includes(kw)) return sec;
+    }
+    // Also try div with role="region" or aria-label
+    for (const div of qa(document, "div[aria-label]")) {
+      if ((div.getAttribute("aria-label") || "").toLowerCase().includes(kw)) return div;
     }
     return null;
   }
 
   // ─────────────────────────────────────────────────────────
-  // HEADER (main profile page)
+  // HEADER
   // ─────────────────────────────────────────────────────────
   function extractHeader() {
     return {
@@ -178,7 +270,8 @@
         "h1"),
       headline: firstText(document,
         ".text-body-medium.break-words",
-        ".pv-text-details__left-panel .t-16"),
+        ".pv-text-details__left-panel .t-16",
+        "[data-generated-suggestion-target] .text-body-medium"),
       location: firstText(document,
         ".text-body-small.inline.t-black--light.break-words",
         ".pv-text-details__left-panel .t-14 span[aria-hidden='true']"),
@@ -200,15 +293,22 @@
     const spans = qa(section, "span[aria-hidden='true']")
       .map(s => clean(s.innerText || s.textContent))
       .filter(Boolean);
-    return spans.reduce((a, b) => b.length > a.length ? b : a, "");
+    if (spans.length) return spans.reduce((a, b) => b.length > a.length ? b : a, "");
+    // Fallback
+    const texts = getText(section);
+    return texts.reduce((a, b) => b.length > a.length ? b : a, "");
   }
 
   // ─────────────────────────────────────────────────────────
   // DATE / DURATION PATTERNS
   // ─────────────────────────────────────────────────────────
-  const DATE_RX = /([A-Z][a-z]{2,8}\.?\s+\d{4}|Present)\s*[–\-—]\s*([A-Z][a-z]{2,8}\.?\s+\d{4}|Present)/;
-  const YEAR_RX = /\d{4}\s*[–\-—]\s*(\d{4}|Present)/;
-  const DUR_RX  = /\d+\s*(yr|yrs|mo|mos)/i;
+  const DATE_RX   = /([A-Z][a-z]{2,8}\.?\s+\d{4}|Present)\s*[–\-—]\s*([A-Z][a-z]{2,8}\.?\s+\d{4}|Present)/;
+  const YEAR_RX   = /\d{4}\s*[–\-—]\s*(\d{4}|Present)/;
+  const DUR_RX    = /\d+\s*(yr|yrs|mo|mos)/i;
+  const ISSUED_RX = /^issued/i;
+  const EXPIRY_RX = /expir/i;
+  const CRED_RX   = /credential\s*id/i;
+
   const isDate  = s => DATE_RX.test(s) || YEAR_RX.test(s);
   const isDur   = s => DUR_RX.test(s);
 
@@ -290,11 +390,17 @@
     if (!root) return [];
     const seen = new Set();
     return getItems(root).flatMap(item => {
+      // Try multiple selectors for skill name — LinkedIn uses different ones
       const nameEl =
-        q(item, ".t-bold span[aria-hidden='true']") ||
-        q(item, ".t-16 span[aria-hidden='true']")   ||
+        q(item, ".t-bold span[aria-hidden='true']")  ||
+        q(item, ".t-16 span[aria-hidden='true']")    ||
+        q(item, ".t-14 span[aria-hidden='true']")    ||
         q(item, "span[aria-hidden='true']");
-      const name = nameEl ? clean(nameEl.innerText) : "";
+      let name = nameEl ? clean(nameEl.innerText) : "";
+      if (!name) {
+        const texts = getSpans(item);
+        name = texts[0] || "";
+      }
       if (!name || seen.has(name)) return [];
       seen.add(name);
       const sub     = getSpans(item).filter(s => s !== name);
@@ -305,26 +411,62 @@
   }
 
   // ─────────────────────────────────────────────────────────
-  // CERTIFICATIONS
+  // CERTIFICATIONS — v1.5: more robust field detection
   // ─────────────────────────────────────────────────────────
   function extractCertifications(root) {
     root = root || findSection("licenses") || findSection("certifications");
     if (!root) return [];
+
     return getItems(root).map(item => {
-      const spans = getSpans(item);
-      let issued = "", expiry = "", credentialId = "";
-      const rest = spans.filter(s => {
-        if (/^issued/i.test(s))       { issued = s; return false; }
-        if (/expir/i.test(s))         { expiry = s; return false; }
-        if (/credential id/i.test(s)) {
-          credentialId = s.replace(/credential id[:\s]*/i, "").trim();
-          return false;
+      // Try aria-hidden spans first, then fall back to universal getText
+      let spans = getSpans(item);
+
+      // If still empty, try grabbing all visible text from the item
+      if (!spans.length) {
+        spans = getText(item);
+      }
+
+      let name = "", issuer = "", issued = "", expiry = "", credentialId = "";
+      const rest = [];
+
+      for (const s of spans) {
+        if (ISSUED_RX.test(s) && !issued)       { issued = s; continue; }
+        if (EXPIRY_RX.test(s) && !expiry)       { expiry = s; continue; }
+        if (CRED_RX.test(s) && !credentialId)   {
+          credentialId = s.replace(/credential\s*id[:\s]*/i, "").trim();
+          continue;
         }
-        return true;
-      });
+        rest.push(s);
+      }
+
+      // Also check for "Issued" label in a sibling/child element
+      if (!issued) {
+        const issuedEl = q(item,
+          "[aria-label*='Issued'], [data-field='dateRange'], .t-14.t-normal.t-black--light span[aria-hidden='true']"
+        );
+        if (issuedEl) {
+          const t = clean(issuedEl.innerText || issuedEl.textContent);
+          if (t) issued = t;
+        }
+      }
+
+      name   = rest[0] || "";
+      issuer = rest[1] || "";
+
+      // Check for credential URL
       const link = q(item, "a[href*='http']");
       const url  = link && !link.href.includes("linkedin.com") ? link.href : "";
-      return { name: rest[0]||"", issuer: rest[1]||"", issued, expiry, credentialId, url };
+
+      // Try getting URL from "Show credential" / "See credential" button
+      if (!url) {
+        const credLink = q(item, "a[href]");
+        const credHref = credLink ? credLink.href : "";
+        // Only use if it looks like an external cert URL
+        const finalUrl = credHref && !credHref.includes("linkedin.com/in/") ? credHref : "";
+        return { name, issuer, issued, expiry, credentialId, url: finalUrl };
+      }
+
+      return { name, issuer, issued, expiry, credentialId, url };
     }).filter(e => e.name);
   }
 
@@ -566,7 +708,12 @@
 
   function extractDetailPage(section) {
     const root        = getDetailRoot();
-    const profileName = firstText(document, ".profile-detail__header-link", ".mn-connection-card__name", "h1");
+    const profileName = firstText(document,
+      ".profile-detail__header-link",
+      ".mn-connection-card__name",
+      "[aria-label*='profile'] h1",
+      "h1"
+    );
 
     const MAP = {
       certifications:  () => extractCertifications(root),
@@ -592,25 +739,34 @@
   }
 
   // ─────────────────────────────────────────────────────────
-  // DEBUG HELPER
-  // Open DevTools on the LinkedIn page and run: window.__liDebug()
-  // This tells you exactly what the extractor sees in the DOM.
+  // DEBUG HELPER — v1.5: more verbose, shows root HTML
+  // Open DevTools on the LinkedIn tab and run: window.__liDebug()
   // ─────────────────────────────────────────────────────────
   window.__liDebug = function () {
-    const root = getDetailRoot();
-    console.group("[Li Extractor] Debug Dump");
+    const root  = getDetailRoot();
+    const items = getItems(root);
+    console.group("[Li Extractor v1.5] Debug Dump");
     console.log("URL:", window.location.href);
     console.log("Detected mode:", detectMode());
     console.log("Detail root el:", root);
+    console.log("Root tag/class:", root.tagName, root.className);
     console.log("Total <li> in root:", qa(root, "li").length);
-    console.log("artdeco-list__item:", qa(root, "li.artdeco-list__item").length);
-    console.log("pvs-list__item (any):", qa(root, "li[class*='pvs-list__item']").length);
-    console.log("data-view-name li:", qa(root, "li[data-view-name]").length);
-    console.log("getItems() count:", getItems(root).length);
-    const items = getItems(root);
+    console.log("pvs-list__item (line-sep):", qa(root, "li.pvs-list__item--line-separated").length);
+    console.log("pvs-list__item (top-pad):",  qa(root, "li.pvs-list__item--with-top-padding").length);
+    console.log("pvs-list__item (any):",      qa(root, "li[class*='pvs-list__item']").length);
+    console.log("artdeco-list__item:",         qa(root, "li.artdeco-list__item").length);
+    console.log("data-view-name li:",          qa(root, "li[data-view-name]").length);
+    console.log("getItems() count:", items.length);
     if (items.length) {
-      console.log("First item spans:", getSpans(items[0]));
-      console.log("First item HTML (600 chars):", items[0].outerHTML.slice(0, 600));
+      console.log("── Item 0 spans (aria-hidden):", getSpans(items[0]));
+      console.log("── Item 0 getText():",           getText(items[0]));
+      console.log("── Item 0 HTML (800 chars):", items[0].outerHTML.slice(0, 800));
+      if (items[1]) {
+        console.log("── Item 1 spans:", getSpans(items[1]));
+        console.log("── Item 1 HTML (800 chars):", items[1].outerHTML.slice(0, 800));
+      }
+    } else {
+      console.warn("No items found. Root HTML (1000 chars):", root.outerHTML.slice(0, 1000));
     }
     console.groupEnd();
   };
