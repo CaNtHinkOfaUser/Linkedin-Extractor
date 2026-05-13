@@ -7,153 +7,90 @@
     <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
     <style>
       :root {
-        --bg:      #0a0a0f;
-        --surface: #12121a;
-        --border:  #1e1e2e;
-        --accent:  #0a84ff;
-        --accent2: #30d158;
-        --gold:    #f5a623;
-        --text:    #e8e8f0;
-        --muted:   #6e6e8a;
-        --error:   #ff453a;
-        --mono:    "Space Mono", monospace;
-        --sans:    "DM Sans", sans-serif;
+        --bg: #0a0a0f; --surface: #12121a; --border: #1e1e2e;
+        --accent: #0a84ff; --accent2: #30d158; --gold: #f5a623;
+        --text: #e8e8f0; --muted: #6e6e8a; --error: #ff453a;
+        --mono: "Space Mono", monospace; --sans: "DM Sans", sans-serif;
       }
-      * { margin: 0; padding: 0; box-sizing: border-box; }
+      * { margin:0; padding:0; box-sizing:border-box; }
+      body { width:340px; background:var(--bg); color:var(--text); font-family:var(--sans); font-size:13px; }
 
-      body {
-        width: 340px;
-        background: var(--bg);
-        color: var(--text);
-        font-family: var(--sans);
-        font-size: 13px;
-      }
+      .header { background:linear-gradient(135deg,#0a1628 0%,#0f1f3d 100%); border-bottom:1px solid var(--border); padding:16px 20px 14px; position:relative; overflow:hidden; }
+      .header::before { content:""; position:absolute; top:-30px; right:-30px; width:120px; height:120px; background:radial-gradient(circle,rgba(10,132,255,.2),transparent 70%); pointer-events:none; }
+      .header-row { display:flex; align-items:center; gap:10px; margin-bottom:4px; }
+      .logo { width:26px; height:26px; background:var(--accent); border-radius:6px; display:flex; align-items:center; justify-content:center; font-family:var(--mono); font-size:10px; font-weight:700; color:#fff; flex-shrink:0; }
+      .app-name { font-family:var(--mono); font-size:12px; font-weight:700; letter-spacing:.5px; }
+      .ver { margin-left:auto; font-family:var(--mono); font-size:9px; color:var(--muted); background:var(--border); padding:2px 6px; border-radius:10px; }
+      .tagline { font-size:11px; color:var(--muted); padding-left:36px; }
 
-      /* ── HEADER ── */
-      .header {
-        background: linear-gradient(135deg, #0a1628 0%, #0f1f3d 100%);
-        border-bottom: 1px solid var(--border);
-        padding: 16px 20px 14px;
-        position: relative;
-        overflow: hidden;
-      }
-      .header::before {
-        content: "";
-        position: absolute; top: -30px; right: -30px;
-        width: 120px; height: 120px;
-        background: radial-gradient(circle, rgba(10,132,255,.2), transparent 70%);
-        pointer-events: none;
-      }
-      .header-row { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
-      .logo { width: 26px; height: 26px; background: var(--accent); border-radius: 6px; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 10px; font-weight: 700; color: #fff; flex-shrink: 0; }
-      .app-name { font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: .5px; }
-      .ver { margin-left: auto; font-family: var(--mono); font-size: 9px; color: var(--muted); background: var(--border); padding: 2px 6px; border-radius: 10px; }
-      .tagline { font-size: 11px; color: var(--muted); padding-left: 36px; }
+      .mode-badge { display:flex; align-items:center; gap:8px; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin:14px 16px 0; transition:border-color .3s; }
+      .mode-badge.mode-main   { border-color:rgba(10,132,255,.4); }
+      .mode-badge.mode-detail { border-color:rgba(48,209,88,.4); }
+      .mode-badge.mode-unknown{ border-color:var(--border); }
+      .mode-icon { font-size:18px; flex-shrink:0; }
+      .mode-info { flex:1; min-width:0; }
+      .mode-label { font-size:11px; font-weight:600; color:var(--text); }
+      .mode-sub   { font-size:10px; color:var(--muted); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
-      /* ── MODE BADGE ── */
-      .mode-badge {
-        display: flex; align-items: center; gap: 8px;
-        background: var(--surface); border: 1px solid var(--border);
-        border-radius: 8px; padding: 10px 12px; margin: 14px 16px 0;
-        transition: border-color .3s;
-      }
-      .mode-badge.mode-main    { border-color: rgba(10,132,255,.4); }
-      .mode-badge.mode-detail  { border-color: rgba(48,209,88,.4); }
-      .mode-badge.mode-unknown { border-color: var(--border); }
+      .chips-wrap { margin:10px 16px 0; display:none; }
+      .chips-wrap.visible { display:block; }
+      .chips-label { font-family:var(--mono); font-size:9px; color:var(--muted); letter-spacing:1px; text-transform:uppercase; margin-bottom:6px; }
+      .chips { display:flex; flex-wrap:wrap; gap:4px; }
+      .chip { font-size:10px; font-weight:500; color:var(--accent); background:rgba(10,132,255,.1); border:1px solid rgba(10,132,255,.25); border-radius:4px; padding:2px 7px; }
+      .chip.empty { color:var(--muted); background:rgba(255,255,255,.03); border-color:var(--border); text-decoration:line-through; opacity:.5; }
 
-      .mode-icon { font-size: 18px; flex-shrink: 0; }
-      .mode-info { flex: 1; min-width: 0; }
-      .mode-label { font-size: 11px; font-weight: 600; color: var(--text); }
-      .mode-sub   { font-size: 10px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .tip { margin:10px 16px 0; background:rgba(245,166,35,.07); border:1px solid rgba(245,166,35,.2); border-radius:8px; padding:9px 11px; font-size:10px; color:var(--gold); line-height:1.5; display:none; }
+      .tip.visible { display:block; }
 
-      /* ── SECTION CHIPS ── */
-      .chips-wrap {
-        margin: 10px 16px 0;
-        display: none;
-      }
-      .chips-wrap.visible { display: block; }
-      .chips-label { font-family: var(--mono); font-size: 9px; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 6px; }
-      .chips { display: flex; flex-wrap: wrap; gap: 4px; }
-      .chip {
-        font-size: 10px; font-weight: 500;
-        color: var(--accent); background: rgba(10,132,255,.1);
-        border: 1px solid rgba(10,132,255,.25);
-        border-radius: 4px; padding: 2px 7px;
-      }
-      .chip.empty { color: var(--muted); background: rgba(255,255,255,.03); border-color: var(--border); text-decoration: line-through; opacity: .5; }
+      .body { padding:12px 16px 14px; }
 
-      /* ── TIP BOX ── */
-      .tip {
-        margin: 10px 16px 0;
-        background: rgba(245,166,35,.07); border: 1px solid rgba(245,166,35,.2);
-        border-radius: 8px; padding: 9px 11px;
-        font-size: 10px; color: var(--gold); line-height: 1.5;
-        display: none;
-      }
-      .tip.visible { display: block; }
+      .extract-btn { width:100%; padding:13px; border:none; border-radius:10px; font-family:var(--mono); font-size:12px; font-weight:700; letter-spacing:.5px; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; transition:all .2s ease; margin-bottom:8px; background:var(--accent); color:#fff; }
+      .extract-btn.detail-mode { background:var(--accent2); }
+      .extract-btn:hover:not(:disabled) { filter:brightness(1.12); box-shadow:0 4px 20px rgba(10,132,255,.3); transform:translateY(-1px); }
+      .extract-btn.detail-mode:hover:not(:disabled) { box-shadow:0 4px 20px rgba(48,209,88,.25); }
+      .extract-btn:active:not(:disabled) { transform:none; }
+      .extract-btn:disabled { opacity:.45; cursor:not-allowed; }
 
-      /* ── BODY ── */
-      .body { padding: 12px 16px 14px; }
+      .spinner { width:13px; height:13px; border:2px solid rgba(255,255,255,.3); border-top-color:#fff; border-radius:50%; animation:spin .7s linear infinite; display:none; }
+      .spinner.visible { display:block; }
+      @keyframes spin { to { transform:rotate(360deg); } }
 
-      /* ── EXTRACT BUTTON ── */
-      .extract-btn {
-        width: 100%; padding: 13px; border: none; border-radius: 10px;
-        font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: .5px;
-        cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;
-        transition: all .2s ease; margin-bottom: 8px;
-        background: var(--accent); color: #fff;
-      }
-      .extract-btn.detail-mode { background: var(--accent2); }
-      .extract-btn:hover:not(:disabled) { filter: brightness(1.12); box-shadow: 0 4px 20px rgba(10,132,255,.3); transform: translateY(-1px); }
-      .extract-btn.detail-mode:hover:not(:disabled) { box-shadow: 0 4px 20px rgba(48,209,88,.25); }
-      .extract-btn:active:not(:disabled) { transform: none; }
-      .extract-btn:disabled { opacity: .45; cursor: not-allowed; }
+      .debug-btn { display:none; align-items:center; justify-content:center; gap:4px; width:100%; padding:6px; border:1px dashed var(--border); border-radius:6px; background:transparent; color:var(--muted); font-family:var(--mono); font-size:9px; cursor:pointer; transition:all .2s; margin-bottom:0; }
+      .debug-btn:hover { border-color:var(--muted); color:var(--text); }
 
-      .spinner { width: 13px; height: 13px; border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; display: none; }
-      .spinner.visible { display: block; }
-      @keyframes spin { to { transform: rotate(360deg); } }
+      .results-panel { display:none; flex-direction:column; margin:0 16px 14px; border:1px solid var(--border); border-radius:10px; overflow:hidden; background:var(--surface); }
+      .results-panel.visible { display:flex; }
+      .results-toolbar { display:flex; align-items:center; justify-content:space-between; padding:7px 10px; border-bottom:1px solid var(--border); background:rgba(255,255,255,.02); }
+      .results-toolbar-left { display:flex; align-items:center; gap:6px; font-family:var(--mono); font-size:9px; color:var(--muted); letter-spacing:.8px; }
+      .results-dot { width:6px; height:6px; border-radius:50%; background:var(--accent2); box-shadow:0 0 6px rgba(48,209,88,.5); }
+      .results-toolbar-right { display:flex; gap:5px; }
+      .tool-btn { padding:4px 9px; border:1px solid var(--border); border-radius:5px; background:transparent; color:var(--muted); font-family:var(--sans); font-size:10px; font-weight:500; cursor:pointer; transition:all .15s; display:flex; align-items:center; gap:4px; }
+      .tool-btn:hover { background:var(--border); color:var(--text); }
+      .tool-btn.copy-all { border-color:rgba(10,132,255,.4); color:var(--accent); background:rgba(10,132,255,.08); }
+      .tool-btn.copy-all:hover { background:rgba(10,132,255,.18); border-color:var(--accent); }
+      .tool-btn.copied { border-color:rgba(48,209,88,.5); color:var(--accent2); background:rgba(48,209,88,.08); }
+      .results-pre { font-family:var(--mono); font-size:8px; line-height:1.65; color:#c8c8dc; white-space:pre-wrap; word-break:break-word; padding:10px 12px; max-height:220px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:var(--border) transparent; }
+      .results-pre::-webkit-scrollbar { width:4px; }
+      .results-pre::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
 
-      /* ── SECONDARY BUTTONS ── */
-      .sec-row { display: flex; gap: 8px; }
-      .sec-btn {
-        flex: 1; padding: 8px; background: var(--surface);
-        border: 1px solid var(--border); border-radius: 8px;
-        color: var(--text); font-family: var(--sans); font-size: 11px; font-weight: 500;
-        cursor: pointer; display: none; align-items: center; justify-content: center; gap: 5px;
-        transition: all .2s;
-      }
-      .sec-btn.visible { display: flex; }
-      .sec-btn:hover { background: var(--border); border-color: var(--accent); color: var(--accent); }
+      .footer { border-top:1px solid var(--border); padding:9px 16px; display:flex; align-items:center; justify-content:space-between; }
+      .footer-tip { font-size:10px; color:var(--muted); }
+      .footer-tip span { color:var(--accent); font-family:var(--mono); }
 
-      /* ── FOOTER ── */
-      .footer {
-        border-top: 1px solid var(--border);
-        padding: 9px 16px;
-        display: flex; align-items: center; justify-content: space-between;
-      }
-      .footer-tip { font-size: 10px; color: var(--muted); }
-      .footer-tip span { color: var(--accent); font-family: var(--mono); }
-
-      @keyframes successPulse {
-        0%,100% { border-color: transparent; }
-        50%      { border-color: var(--accent2); box-shadow: 0 0 16px rgba(48,209,88,.2); }
-      }
-      .flash { animation: successPulse .9s ease; }
+      @keyframes successPulse { 0%,100%{border-color:transparent;} 50%{border-color:var(--accent2);box-shadow:0 0 16px rgba(48,209,88,.2);} }
+      .flash { animation:successPulse .9s ease; }
     </style>
   </head>
   <body>
-
-    <!-- HEADER -->
     <div class="header">
       <div class="header-row">
         <div class="logo">Li</div>
         <div class="app-name">PROFILE EXTRACTOR</div>
-        <div class="ver">v1.1</div>
+        <div class="ver">v1.4</div>
       </div>
-      <div class="tagline">Export LinkedIn profiles to clean text files</div>
+      <div class="tagline">Export LinkedIn profiles to clean text</div>
     </div>
 
-    <!-- MODE BADGE -->
     <div class="mode-badge mode-unknown" id="modeBadge">
       <div class="mode-icon" id="modeIcon">⏳</div>
       <div class="mode-info">
@@ -162,33 +99,39 @@
       </div>
     </div>
 
-    <!-- SECTION CHIPS (shown after extract on main mode) -->
     <div class="chips-wrap" id="chipsWrap">
       <div class="chips-label">Sections found</div>
       <div class="chips" id="chipsGrid"></div>
     </div>
 
-    <!-- TIP -->
     <div class="tip" id="tip">
       💡 Scroll the full profile before extracting so LinkedIn loads all sections.
       On detail pages, scroll to the bottom to load all entries.
     </div>
 
-    <!-- BODY -->
     <div class="body">
       <button class="extract-btn" id="extractBtn" disabled>
         <div class="spinner" id="spinner"></div>
         <span id="btnIcon">⬇</span>
-        <span id="btnText">EXTRACT & DOWNLOAD</span>
+        <span id="btnText">EXTRACT</span>
       </button>
-
-      <div class="sec-row">
-        <button class="sec-btn" id="previewBtn">👁 Preview</button>
-        <button class="sec-btn" id="copyBtn">📋 Copy</button>
-      </div>
+      <button class="debug-btn" id="debugBtn">🔍 Debug (check DevTools console on LinkedIn tab)</button>
     </div>
 
-    <!-- FOOTER -->
+    <div class="results-panel" id="resultsPanel">
+      <div class="results-toolbar">
+        <div class="results-toolbar-left">
+          <div class="results-dot"></div>
+          <span>EXTRACTED OUTPUT</span>
+        </div>
+        <div class="results-toolbar-right">
+          <button class="tool-btn" id="clearBtn">✕ Clear</button>
+          <button class="tool-btn copy-all" id="copyAllBtn">📋 Copy All</button>
+        </div>
+      </div>
+      <pre class="results-pre" id="resultsPre"></pre>
+    </div>
+
     <div class="footer">
       <div class="footer-tip" id="footerTip">
         Navigate to a <span>linkedin.com/in/</span> page
