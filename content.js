@@ -1,15 +1,13 @@
-// LinkedIn Profile Extractor — Content Script v1.3
-// Multi-strategy extraction: tries multiple selectors so it works
-// regardless of which LinkedIn DOM variant is served.
+// LinkedIn Profile Extractor — Content Script
+// Supports two modes:
+//   1. MAIN PROFILE  : linkedin.com/in/username
+//   2. DETAIL PAGE   : linkedin.com/in/username/details/certifications/ (and all /details/* sub-pages)
 
 (function () {
   "use strict";
 
-  if (window.__linkedinExtractorLoaded) return;
-  window.__linkedinExtractorLoaded = true;
-
   // ─────────────────────────────────────────────────────────
-  // URL → section name mapping
+  // URL → section name mapping for /details/* sub-pages
   // ─────────────────────────────────────────────────────────
 
   const DETAIL_PAGE_MAP = {
@@ -41,82 +39,37 @@
       .trim();
   }
 
-  function $q(root, sel) {
-    return (root || document).querySelector(sel);
+  function getText(el, selector) {
+    if (!el) return "";
+    const found = selector ? el.querySelector(selector) : el;
+    return found ? clean(found.innerText || found.textContent) : "";
   }
 
-  function $qa(root, sel) {
-    return Array.from((root || document).querySelectorAll(sel));
+  function getAll(root, selector) {
+    return root ? Array.from(root.querySelectorAll(selector)) : [];
   }
 
-  // Get visible text spans inside an element, excluding those inside
-  // a nested list item (to avoid absorbing child-entry text).
   function getSpans(el) {
-    if (!el) return [];
-    return $qa(el, "span[aria-hidden='true']")
-      .filter((s) => {
-        let p = s.parentElement;
-        while (p && p !== el) {
-          if (p.tagName === "LI") return false;
-          p = p.parentElement;
-        }
-        return true;
-      })
-      .map((s) => clean(s.innerText || s.textContent))
-      .filter((s) => s && s !== "·" && s !== "•" && s !== "|" && s !== "–" && s !== "-");
+    return getAll(el, "span[aria-hidden='true']")
+      .map((s) => clean(s.innerText))
+      .filter((s) => s && s !== "·" && s !== "•" && s !== "|");
   }
 
-  // Get ALL visible text spans (including nested) — used for about/text blocks.
-  function getAllSpans(el) {
-    if (!el) return [];
-    return $qa(el, "span[aria-hidden='true']")
-      .map((s) => clean(s.innerText || s.textContent))
-      .filter((s) => s && s !== "·" && s !== "•" && s !== "|" && s !== "–" && s !== "-");
-  }
-
-  // innerText of the first matching selector that has text.
-  function getText(root, ...selectors) {
-    for (const sel of selectors) {
-      const el = $q(root, sel);
+  function getDescription(item) {
+    const candidates = [
+      ".inline-show-more-text span[aria-hidden='true']",
+      ".pvs-list__outer-container span[aria-hidden='true']",
+      ".display-flex.full-width span[aria-hidden='true']",
+    ];
+    for (const sel of candidates) {
+      const el = item.querySelector(sel);
       if (el) {
-        const t = clean(el.innerText || el.textContent);
-        if (t) return t;
+        const t = clean(el.innerText);
+        if (t.length > 30) return t;
       }
     }
-    return "";
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // ITEM FINDERS — multiple strategies, most specific first
-  // ─────────────────────────────────────────────────────────
-
-  // Returns top-level list items from a root, trying several selectors.
-  function getItems(root) {
-    if (!root) return [];
-
-    // Try each selector; return first that yields results.
-    // "top-level" = not nested inside another matching li.
-    const ITEM_SELECTORS = [
-      "li.artdeco-list__item",
-      "li.pvs-list__item--line-separated",
-      "li.pvs-list__item--with-top-padding",
-      "li[class*='pvs-list__item']",
-      "li[data-view-name]",
-    ];
-
-    for (const sel of ITEM_SELECTORS) {
-      const all   = $qa(root, sel);
-      const items = all.filter((li) => !li.parentElement?.closest(sel));
-      if (items.length > 0) return items;
-    }
-
-    // Last resort: direct <li> children of the first <ul> with multiple items.
-    for (const ul of $qa(root, "ul")) {
-      const lis = Array.from(ul.children).filter((c) => c.tagName === "LI");
-      if (lis.length > 0) return lis;
-    }
-
-    return [];
+    const all = getSpans(item);
+    return all.reduce((longest, s) => (s.length > longest.length ? s : longest), "");
   }
 
   // ─────────────────────────────────────────────────────────
@@ -125,53 +78,42 @@
 
   function detectMode() {
     const path = window.location.pathname;
-    const detailMatch = path.match(/\/in\/[^/]+\/details\/([^/?]+)/);
+    const detailMatch = path.match(/\/in\/[^/]+\/details\/([^/]+)\/?/);
     if (detailMatch) {
-      const slug    = detailMatch[1].toLowerCase();
+      const slug = detailMatch[1].toLowerCase();
       const section = DETAIL_PAGE_MAP[slug] || slug;
       return { mode: "detail", section, slug };
     }
-    if (path.match(/\/in\/[^/?]+\/?$/)) {
+    if (path.match(/\/in\/[^/]+\/?$/)) {
       return { mode: "main" };
     }
     return { mode: "unknown" };
   }
 
   // ─────────────────────────────────────────────────────────
-  // ROOT FINDERS
+  // SECTION FINDER (for main profile page)
   // ─────────────────────────────────────────────────────────
 
-  function getDetailRoot() {
-    return (
-      $q(document, "main .scaffold-finite-scroll__content") ||
-      $q(document, ".scaffold-finite-scroll__content")      ||
-      $q(document, "main")                                  ||
-      document.body
-    );
+  function findSectionByHeading(keyword) {
+    const kw = keyword.toLowerCase();
+    for (const sec of getAll(document, "section")) {
+      const label = (sec.getAttribute("aria-label") || "").toLowerCase();
+      if (label.includes(kw)) return sec;
+      const h2 = sec.querySelector("h2");
+      if (h2 && clean(h2.innerText).toLowerCase().includes(kw)) return sec;
+      const dataSec = (sec.getAttribute("data-section") || "").toLowerCase();
+      if (dataSec.includes(kw)) return sec;
+    }
+    return null;
   }
 
-  function findSection(keyword) {
-    const kw = keyword.toLowerCase();
-
-    // 1. aria-label on <section>
-    for (const sec of $qa(document, "section")) {
-      if ((sec.getAttribute("aria-label") || "").toLowerCase().includes(kw)) return sec;
-    }
-    // 2. h2 text inside <section>
-    for (const sec of $qa(document, "section")) {
-      const h2 = $q(sec, "h2");
-      if (h2 && clean(h2.innerText).toLowerCase().includes(kw)) return sec;
-    }
-    // 3. data-section attribute
-    for (const sec of $qa(document, "section")) {
-      if ((sec.getAttribute("data-section") || "").toLowerCase().includes(kw)) return sec;
-    }
-    // 4. id containing keyword
-    const slug  = kw.replace(/\s/g, "-");
-    const byId  = $q(document, `[id*="${slug}"]`);
-    if (byId) return byId.closest("section") || byId;
-
-    return null;
+  // Detail page: items live inside main
+  function getDetailRoot() {
+    return (
+      document.querySelector("main .scaffold-finite-scroll__content") ||
+      document.querySelector("main") ||
+      document.body
+    );
   }
 
   // ─────────────────────────────────────────────────────────
@@ -179,25 +121,26 @@
   // ─────────────────────────────────────────────────────────
 
   function extractHeader() {
-    const name = getText(document,
-      "h1.text-heading-xlarge",
-      ".pv-text-details__left-panel h1",
-      "h1"
-    );
-    const headline = getText(document,
-      ".text-body-medium.break-words",
-      ".pv-text-details__left-panel .t-16",
-      "[data-generated-suggestion-target] ~ div .t-16"
-    );
-    const location = getText(document,
-      ".text-body-small.inline.t-black--light.break-words",
+    const name =
+      getText(document, "h1.text-heading-xlarge") ||
+      getText(document, "h1");
+
+    const headline =
+      getText(document, ".text-body-medium.break-words") ||
+      getText(document, ".pv-text-details__left-panel .t-16");
+
+    const locationEl = document.querySelector(
+      ".text-body-small.inline.t-black--light.break-words, " +
       ".pv-text-details__left-panel .t-14 span[aria-hidden='true']"
     );
-    const connections = getText(document,
-      ".pvs-header__optional-link .t-bold",
-      ".pv-text-details__right-panel span.t-bold",
-      "a[href*='connections'] span.t-bold"
+    const location = locationEl ? clean(locationEl.innerText) : "";
+
+    const connectionsEl = document.querySelector(
+      ".pvs-header__optional-link .t-bold, " +
+      ".pv-text-details__right-panel span.t-bold"
     );
+    const connections = connectionsEl ? clean(connectionsEl.innerText) : "";
+
     return { name, headline, location, connections };
   }
 
@@ -207,17 +150,12 @@
 
   function extractAbout() {
     const section =
-      findSection("about") ||
-      $q(document, "section[data-section='summary']");
+      findSectionByHeading("about") ||
+      document.querySelector("section[data-section='summary']");
     if (!section) return "";
-
-    const showMore = $q(section, ".inline-show-more-text span[aria-hidden='true']");
-    if (showMore) {
-      const t = clean(showMore.innerText);
-      if (t.length > 10) return t;
-    }
-
-    const spans = getAllSpans(section).filter(Boolean);
+    const spans = getAll(section, "span[aria-hidden='true']")
+      .map((s) => clean(s.innerText))
+      .filter(Boolean);
     return spans.reduce((a, b) => (b.length > a.length ? b : a), "");
   }
 
@@ -225,20 +163,22 @@
   // EXPERIENCE
   // ─────────────────────────────────────────────────────────
 
-  const DATE_PAT     = /([A-Z][a-z]{2,8}\.?\s+\d{4}|Present)\s*[–\-—]\s*([A-Z][a-z]{2,8}\.?\s+\d{4}|Present)/;
-  const YEAR_PAT     = /\d{4}\s*[–\-—]\s*(\d{4}|Present)/;
-  const DURATION_PAT = /\d+\s*(yr|yrs|mo|mos)/i;
-
   function parseExpItem(item, overrideCompany) {
     const spans = getSpans(item);
+    const datePattern = /([A-Z][a-z]{2,9}\.?\s+\d{4}|Present)\s*[–\-—]\s*([A-Z][a-z]{2,9}\.?\s+\d{4}|Present)/;
+    const yearPattern  = /\d{4}\s*[–\-—]\s*(\d{4}|Present)/;
+    const durationPattern = /\d+\s*(yr|mo|yr|mos)/i;
+
     let duration = "", durationLen = "";
     for (const s of spans) {
-      if (!duration && (DATE_PAT.test(s) || YEAR_PAT.test(s))) { duration = s; }
-      else if (!durationLen && DURATION_PAT.test(s)) { durationLen = s; }
+      if (!duration && (datePattern.test(s) || yearPattern.test(s))) { duration = s; }
+      else if (!durationLen && durationPattern.test(s)) { durationLen = s; }
     }
+
     const meaningful = spans.filter(
-      (s) => !DATE_PAT.test(s) && !YEAR_PAT.test(s) && !DURATION_PAT.test(s)
+      (s) => !datePattern.test(s) && !yearPattern.test(s) && !durationPattern.test(s)
     );
+
     const entry = {
       title:       meaningful[0] || "",
       company:     overrideCompany || meaningful[1] || "",
@@ -246,26 +186,23 @@
       location:    "",
       description: "",
     };
+
     const nonHeader = meaningful.slice(overrideCompany ? 1 : 2);
     for (const s of nonHeader) {
       if (s.length < 60 && !entry.location) entry.location = s;
-      else if (s.length >= 30 && !entry.description) entry.description = s;
+      else if (s.length > 30 && !entry.description) entry.description = s;
     }
     return entry;
   }
 
   function extractExperience(root) {
-    root = root || findSection("experience");
+    root = root || findSectionByHeading("experience");
     if (!root) return [];
     const entries = [];
-    for (const item of getItems(root)) {
-      const nested = $qa(item, "li.artdeco-list__item, li[class*='pvs-list__item']").filter(
-        (li) => li !== item && item.contains(li)
-      );
+    for (const item of getAll(root, "li.artdeco-list__item")) {
+      const nested = getAll(item, ".pvs-entity--with-path li.artdeco-list__item");
       if (nested.length > 0) {
-        const companyEl =
-          $q(item, ".t-16.t-black.t-bold span[aria-hidden='true']") ||
-          $q(item, ".t-bold span[aria-hidden='true']");
+        const companyEl = item.querySelector(".t-16.t-black.t-bold span[aria-hidden='true'], .t-bold span[aria-hidden='true']");
         const company = companyEl ? clean(companyEl.innerText) : "";
         for (const role of nested) {
           const e = parseExpItem(role, company);
@@ -284,26 +221,29 @@
   // ─────────────────────────────────────────────────────────
 
   function extractEducation(root) {
-    root = root || findSection("education");
+    root = root || findSectionByHeading("education");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const spans = getSpans(item);
-      let duration = "";
-      const rest = spans.filter((s) => {
-        if (!duration && (YEAR_PAT.test(s) || DATE_PAT.test(s))) { duration = s; return false; }
-        return true;
-      });
-      const descEl = $q(item, ".inline-show-more-text span[aria-hidden='true']");
-      return {
-        school:      rest[0] || "",
-        degree:      rest[1] || "",
-        field:       rest[2] || "",
-        duration,
-        grade:       rest.find((s) => /grade|cgpa|gpa/i.test(s)) || "",
-        activities:  rest.find((s) => /activities|clubs|societies/i.test(s)) || "",
-        description: descEl ? clean(descEl.innerText) : "",
-      };
-    }).filter((e) => e.school);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const spans = getSpans(item);
+        const yearPat = /\d{4}\s*[–\-—]\s*(\d{4}|Present)/;
+        let duration = "";
+        const rest = spans.filter((s) => {
+          if (!duration && yearPat.test(s)) { duration = s; return false; }
+          return true;
+        });
+        const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
+        return {
+          school:      rest[0] || "",
+          degree:      rest[1] || "",
+          field:       rest[2] || "",
+          duration,
+          grade:       rest.find((s) => /grade|cgpa|gpa/i.test(s)) || "",
+          activities:  rest.find((s) => /activities|clubs|societies/i.test(s)) || "",
+          description: descEl ? clean(descEl.innerText) : "",
+        };
+      })
+      .filter((e) => e.school);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -311,23 +251,22 @@
   // ─────────────────────────────────────────────────────────
 
   function extractSkills(root) {
-    root = root || findSection("skills");
+    root = root || findSectionByHeading("skills");
     if (!root) return [];
     const seen = new Set();
     const skills = [];
-    for (const item of getItems(root)) {
+    getAll(root, "li.artdeco-list__item").forEach((item) => {
       const nameEl =
-        $q(item, ".t-bold span[aria-hidden='true']") ||
-        $q(item, ".t-16 span[aria-hidden='true']")   ||
-        $q(item, "span[aria-hidden='true']");
+        item.querySelector(".t-bold span[aria-hidden='true']") ||
+        item.querySelector(".t-16 span[aria-hidden='true']");
       const name = nameEl ? clean(nameEl.innerText) : "";
-      if (!name || seen.has(name)) continue;
+      if (!name || seen.has(name)) return;
       seen.add(name);
-      const subSpans    = getSpans(item).filter((s) => s !== name);
+      const subSpans = getSpans(item).filter((s) => s !== name);
       const endorseText = subSpans.find((s) => /endorsement|people/i.test(s)) || "";
       const category    = subSpans.find((s) => !/endorsement|people/i.test(s) && s.length < 60) || "";
       skills.push({ name, category, endorsements: endorseText });
-    }
+    });
     return skills;
   }
 
@@ -337,25 +276,27 @@
 
   function extractCertifications(root) {
     root = root ||
-      findSection("licenses") ||
-      findSection("certifications");
+      findSectionByHeading("licenses & certifications") ||
+      findSectionByHeading("certifications");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const spans = getSpans(item);
-      let issued = "", expiry = "", credentialId = "";
-      const rest = spans.filter((s) => {
-        if (/^issued/i.test(s))       { issued = s; return false; }
-        if (/expir/i.test(s))         { expiry = s; return false; }
-        if (/credential id/i.test(s)) {
-          credentialId = s.replace(/credential id[:\s]*/i, "").trim();
-          return false;
-        }
-        return true;
-      });
-      const link = $q(item, "a[href*='http']");
-      const url  = link && !link.href.includes("linkedin.com") ? link.href : "";
-      return { name: rest[0] || "", issuer: rest[1] || "", issued, expiry, credentialId, url };
-    }).filter((e) => e.name);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const spans = getSpans(item);
+        let issued = "", expiry = "", credentialId = "";
+        const rest = spans.filter((s) => {
+          if (/^issued/i.test(s))       { issued = s;        return false; }
+          if (/expir/i.test(s))         { expiry = s;        return false; }
+          if (/credential id/i.test(s)) {
+            credentialId = s.replace(/credential id[:\s]*/i, "").trim();
+            return false;
+          }
+          return true;
+        });
+        const link = item.querySelector("a[href*='http']");
+        const url  = link && !link.href.includes("linkedin.com") ? link.href : "";
+        return { name: rest[0] || "", issuer: rest[1] || "", issued, expiry, credentialId, url };
+      })
+      .filter((e) => e.name);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -363,25 +304,28 @@
   // ─────────────────────────────────────────────────────────
 
   function extractProjects(root) {
-    root = root || findSection("projects");
+    root = root || findSectionByHeading("projects");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const spans = getSpans(item);
-      let duration = "";
-      const rest = spans.filter((s) => {
-        if (!duration && (DATE_PAT.test(s) || YEAR_PAT.test(s))) { duration = s; return false; }
-        return true;
-      });
-      const descEl = $q(item, ".inline-show-more-text span[aria-hidden='true']");
-      const link   = $q(item, "a[href*='http']");
-      return {
-        name:        rest[0] || "",
-        association: rest[1] || "",
-        duration,
-        description: descEl ? clean(descEl.innerText) : "",
-        url:         link && !link.href.includes("linkedin.com/in/") ? link.href : "",
-      };
-    }).filter((e) => e.name);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const spans = getSpans(item);
+        const datePat = /([A-Z][a-z]{2,9}\.?\s+\d{4}|Present)\s*[–\-—]/;
+        let duration = "";
+        const rest = spans.filter((s) => {
+          if (!duration && datePat.test(s)) { duration = s; return false; }
+          return true;
+        });
+        const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
+        const link = item.querySelector("a[href*='http']");
+        return {
+          name:        rest[0] || "",
+          association: rest[1] || "",
+          duration,
+          description: descEl ? clean(descEl.innerText) : getDescription(item),
+          url:         link && !link.href.includes("linkedin.com/in/") ? link.href : "",
+        };
+      })
+      .filter((e) => e.name);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -389,24 +333,30 @@
   // ─────────────────────────────────────────────────────────
 
   function extractVolunteering(root) {
-    root = root || findSection("volunteer") || findSection("volunteering");
+    root = root ||
+      findSectionByHeading("volunteer experience") ||
+      findSectionByHeading("volunteering");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const spans = getSpans(item);
-      let duration = "", cause = "";
-      const rest = spans.filter((s) => {
-        if (!duration && (DATE_PAT.test(s) || YEAR_PAT.test(s))) { duration = s; return false; }
-        if (/cause|social/i.test(s)) { cause = s; return false; }
-        return true;
-      });
-      const descEl = $q(item, ".inline-show-more-text span[aria-hidden='true']");
-      return {
-        role:         rest[0] || "",
-        organization: rest[1] || "",
-        duration, cause,
-        description: descEl ? clean(descEl.innerText) : "",
-      };
-    }).filter((e) => e.role);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const spans = getSpans(item);
+        const datePat = /([A-Z][a-z]{2,9}\.?\s+\d{4}|Present)\s*[–\-—]/;
+        let duration = "", cause = "";
+        const rest = spans.filter((s) => {
+          if (!duration && datePat.test(s))  { duration = s; return false; }
+          if (/cause|social/i.test(s))       { cause = s;    return false; }
+          return true;
+        });
+        const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
+        return {
+          role:         rest[0] || "",
+          organization: rest[1] || "",
+          duration,
+          cause,
+          description: descEl ? clean(descEl.innerText) : "",
+        };
+      })
+      .filter((e) => e.role);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -414,12 +364,14 @@
   // ─────────────────────────────────────────────────────────
 
   function extractLanguages(root) {
-    root = root || findSection("languages");
+    root = root || findSectionByHeading("languages");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const spans = getSpans(item);
-      return { language: spans[0] || "", proficiency: spans[1] || "" };
-    }).filter((e) => e.language);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const spans = getSpans(item);
+        return { language: spans[0] || "", proficiency: spans[1] || "" };
+      })
+      .filter((e) => e.language);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -427,18 +379,22 @@
   // ─────────────────────────────────────────────────────────
 
   function extractHonors(root) {
-    root = root || findSection("honors") || findSection("awards");
+    root = root ||
+      findSectionByHeading("honors & awards") ||
+      findSectionByHeading("honors");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const spans  = getSpans(item);
-      const descEl = $q(item, ".inline-show-more-text span[aria-hidden='true']");
-      return {
-        title:       spans[0] || "",
-        issuer:      spans[1] || "",
-        date:        spans[2] || "",
-        description: descEl ? clean(descEl.innerText) : "",
-      };
-    }).filter((e) => e.title);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const spans = getSpans(item);
+        const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
+        return {
+          title:       spans[0] || "",
+          issuer:      spans[1] || "",
+          date:        spans[2] || "",
+          description: descEl ? clean(descEl.innerText) : "",
+        };
+      })
+      .filter((e) => e.title);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -446,20 +402,22 @@
   // ─────────────────────────────────────────────────────────
 
   function extractPublications(root) {
-    root = root || findSection("publications");
+    root = root || findSectionByHeading("publications");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const spans  = getSpans(item);
-      const descEl = $q(item, ".inline-show-more-text span[aria-hidden='true']");
-      const link   = $q(item, "a[href*='http']");
-      return {
-        title:       spans[0] || "",
-        publisher:   spans[1] || "",
-        date:        spans[2] || "",
-        description: descEl ? clean(descEl.innerText) : "",
-        url:         link && !link.href.includes("linkedin.com") ? link.href : "",
-      };
-    }).filter((e) => e.title);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const spans = getSpans(item);
+        const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
+        const link = item.querySelector("a[href*='http']");
+        return {
+          title:       spans[0] || "",
+          publisher:   spans[1] || "",
+          date:        spans[2] || "",
+          description: descEl ? clean(descEl.innerText) : "",
+          url:         link && !link.href.includes("linkedin.com") ? link.href : "",
+        };
+      })
+      .filter((e) => e.title);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -467,12 +425,14 @@
   // ─────────────────────────────────────────────────────────
 
   function extractCourses(root) {
-    root = root || findSection("courses");
+    root = root || findSectionByHeading("courses");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const spans = getSpans(item);
-      return { name: spans[0] || "", number: spans[1] || "" };
-    }).filter((e) => e.name);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const spans = getSpans(item);
+        return { name: spans[0] || "", number: spans[1] || "" };
+      })
+      .filter((e) => e.name);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -480,15 +440,22 @@
   // ─────────────────────────────────────────────────────────
 
   function extractRecommendations(root) {
-    root = root || findSection("recommendations");
+    root = root || findSectionByHeading("recommendations");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const from   = getText(item, ".t-bold span[aria-hidden='true']", ".t-16 span[aria-hidden='true']");
-      const role   = getText(item, ".t-14.t-normal span[aria-hidden='true']");
-      const textEl = $q(item, ".inline-show-more-text span[aria-hidden='true']");
-      const text   = textEl ? clean(textEl.innerText) : "";
-      return { from, role, text };
-    }).filter((e) => e.from || e.text);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const nameEl = item.querySelector(".t-bold span[aria-hidden='true'], .t-16 span[aria-hidden='true']");
+        const roleEl = item.querySelector(".t-14.t-normal span[aria-hidden='true']");
+        const textEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
+        const from   = nameEl ? clean(nameEl.innerText) : "";
+        const text   = textEl ? clean(textEl.innerText) : getDescription(item);
+        return {
+          from,
+          role: roleEl ? clean(roleEl.innerText) : "",
+          text,
+        };
+      })
+      .filter((e) => e.from || e.text);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -496,13 +463,15 @@
   // ─────────────────────────────────────────────────────────
 
   function extractOrganizations(root) {
-    root = root || findSection("organizations");
+    root = root || findSectionByHeading("organizations");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const spans  = getSpans(item);
-      const descEl = $q(item, ".inline-show-more-text span[aria-hidden='true']");
-      return { name: spans[0]||"", role: spans[1]||"", duration: spans[2]||"", description: descEl ? clean(descEl.innerText) : "" };
-    }).filter((e) => e.name);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const spans = getSpans(item);
+        const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
+        return { name: spans[0] || "", role: spans[1] || "", duration: spans[2] || "", description: descEl ? clean(descEl.innerText) : "" };
+      })
+      .filter((e) => e.name);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -510,13 +479,15 @@
   // ─────────────────────────────────────────────────────────
 
   function extractPatents(root) {
-    root = root || findSection("patents");
+    root = root || findSectionByHeading("patents");
     if (!root) return [];
-    return getItems(root).map((item) => {
-      const spans  = getSpans(item);
-      const descEl = $q(item, ".inline-show-more-text span[aria-hidden='true']");
-      return { title: spans[0]||"", status: spans[1]||"", number: spans[2]||"", date: spans[3]||"", description: descEl ? clean(descEl.innerText) : "" };
-    }).filter((e) => e.title);
+    return getAll(root, "li.artdeco-list__item")
+      .map((item) => {
+        const spans = getSpans(item);
+        const descEl = item.querySelector(".inline-show-more-text span[aria-hidden='true']");
+        return { title: spans[0] || "", status: spans[1] || "", number: spans[2] || "", date: spans[3] || "", description: descEl ? clean(descEl.innerText) : "" };
+      })
+      .filter((e) => e.title);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -547,31 +518,26 @@
       `  Mode      : Full Profile`, DIV);
 
     lines.push(heading("Personal Information"));
-    f("Name", profile.header.name);
-    f("Headline", profile.header.headline);
-    f("Location", profile.header.location);
-    f("Connections", profile.header.connections);
+    f("Name", profile.header.name); f("Headline", profile.header.headline);
+    f("Location", profile.header.location); f("Connections", profile.header.connections);
 
-    if (profile.about) {
-      lines.push(heading("About"));
-      lines.push(`  ${profile.about}`);
-    }
+    if (profile.about) { lines.push(heading("About")); lines.push(`  ${profile.about}`); }
 
-    const SECTIONS = [
-      ["experience",      "Experience",               (e,i) => { lines.push(subHeading(`Role ${i+1}`));    f("Title",e.title);f("Company",e.company);f("Duration",e.duration);f("Location",e.location);f("Description",e.description); }],
-      ["education",       "Education",                (e,i) => { lines.push(subHeading(`Entry ${i+1}`));   f("School",e.school);f("Degree",e.degree);f("Field",e.field);f("Duration",e.duration);f("Grade",e.grade);f("Activities",e.activities);f("Description",e.description); }],
-      ["skills",          "Skills",                   (e)   => { const x=[e.category,e.endorsements].filter(Boolean).join(" · "); lines.push(`  • ${e.name}${x?`  [${x}]`:""}`); }],
-      ["certifications",  "Licenses & Certifications",(e,i) => { lines.push(subHeading(`Cert ${i+1}`));   f("Name",e.name);f("Issuer",e.issuer);f("Issued",e.issued);f("Expires",e.expiry);f("Credential ID",e.credentialId);f("URL",e.url); }],
-      ["projects",        "Projects",                 (e,i) => { lines.push(subHeading(`Project ${i+1}`)); f("Name",e.name);f("Association",e.association);f("Duration",e.duration);f("Description",e.description);f("URL",e.url); }],
-      ["volunteering",    "Volunteer Experience",     (e,i) => { lines.push(subHeading(`Entry ${i+1}`));   f("Role",e.role);f("Organization",e.organization);f("Duration",e.duration);f("Cause",e.cause);f("Description",e.description); }],
-      ["languages",       "Languages",                (e)   => { lines.push(`  • ${e.language}${e.proficiency ? ` — ${e.proficiency}` : ""}`); }],
-      ["honors",          "Honors & Awards",          (e,i) => { lines.push(subHeading(`Award ${i+1}`));   f("Title",e.title);f("Issuer",e.issuer);f("Date",e.date);f("Description",e.description); }],
-      ["publications",    "Publications",             (e,i) => { lines.push(subHeading(`Pub ${i+1}`));     f("Title",e.title);f("Publisher",e.publisher);f("Date",e.date);f("Description",e.description);f("URL",e.url); }],
-      ["courses",         "Courses",                  (e)   => { lines.push(`  • ${e.name}${e.number ? ` [${e.number}]` : ""}`); }],
-      ["recommendations", "Recommendations",          (e,i) => { lines.push(subHeading(`Rec ${i+1}`));     f("From",e.from);f("Their Role",e.role); if(e.text){lines.push(`  Text:`);lines.push(`    "${e.text}"`);} }],
+    const sections = [
+      ["experience",      `Experience`,                  (e, i) => { lines.push(subHeading(`Role ${i+1}`)); f("Title",e.title);f("Company",e.company);f("Duration",e.duration);f("Location",e.location);f("Description",e.description); }],
+      ["education",       `Education`,                   (e, i) => { lines.push(subHeading(`Entry ${i+1}`)); f("School",e.school);f("Degree",e.degree);f("Field",e.field);f("Duration",e.duration);f("Grade",e.grade);f("Activities",e.activities);f("Description",e.description); }],
+      ["skills",          `Skills`,                      (e)    => { const x=[e.category,e.endorsements].filter(Boolean).join(" · "); lines.push(`  • ${e.name}${x?`  [${x}]`:""}`); }],
+      ["certifications",  `Licenses & Certifications`,   (e, i) => { lines.push(subHeading(`Cert ${i+1}`)); f("Name",e.name);f("Issuer",e.issuer);f("Issued",e.issued);f("Expires",e.expiry);f("Credential ID",e.credentialId);f("URL",e.url); }],
+      ["projects",        `Projects`,                    (e, i) => { lines.push(subHeading(`Project ${i+1}`)); f("Name",e.name);f("Association",e.association);f("Duration",e.duration);f("Description",e.description);f("URL",e.url); }],
+      ["volunteering",    `Volunteer Experience`,        (e, i) => { lines.push(subHeading(`Entry ${i+1}`)); f("Role",e.role);f("Organization",e.organization);f("Duration",e.duration);f("Cause",e.cause);f("Description",e.description); }],
+      ["languages",       `Languages`,                   (e)    => { lines.push(`  • ${e.language}${e.proficiency ? ` — ${e.proficiency}` : ""}`); }],
+      ["honors",          `Honors & Awards`,             (e, i) => { lines.push(subHeading(`Award ${i+1}`)); f("Title",e.title);f("Issuer",e.issuer);f("Date",e.date);f("Description",e.description); }],
+      ["publications",    `Publications`,                (e, i) => { lines.push(subHeading(`Pub ${i+1}`)); f("Title",e.title);f("Publisher",e.publisher);f("Date",e.date);f("Description",e.description);f("URL",e.url); }],
+      ["courses",         `Courses`,                     (e)    => { lines.push(`  • ${e.name}${e.number ? ` [${e.number}]` : ""}`); }],
+      ["recommendations", `Recommendations`,             (e, i) => { lines.push(subHeading(`Rec ${i+1}`)); f("From",e.from);f("Their Role",e.role); if(e.text){lines.push(`  Text:`);lines.push(`    "${e.text}"`);} }],
     ];
 
-    for (const [key, label, renderer] of SECTIONS) {
+    for (const [key, label, renderer] of sections) {
       const data = profile[key];
       if (!data || !data.length) continue;
       lines.push(heading(`${label} (${data.length})`));
@@ -582,19 +548,19 @@
     return lines.filter((l) => l !== null).join("\n");
   }
 
-  function formatDetail(sectionName, data, profileName) {
-    const lines = [
-      DIV,
+  function formatDetailSection(sectionName, data, profileName) {
+    const lines = [];
+    lines.push(DIV,
       `  LINKEDIN — ${sectionName.toUpperCase()}`,
       profileName ? `  Profile   : ${profileName}` : null,
       `  Extracted : ${new Date().toLocaleString()}`,
       `  Source    : ${window.location.href}`,
-      `  Entries   : ${data.length}`,
-      DIV,
-    ];
+      `  Mode      : Detail Page — all ${data.length} entries`,
+      DIV
+    );
 
     if (!data.length) {
-      lines.push("", "  No entries found. Make sure the page has fully loaded.", "");
+      lines.push("", "  No entries found on this page.", "");
     } else {
       data.forEach((entry, i) => {
         lines.push(subHeading(`Entry ${i + 1}`));
@@ -639,12 +605,10 @@
   }
 
   function extractDetailPage(section) {
-    const root        = getDetailRoot();
-    const profileName = getText(document,
-      ".profile-detail__header-link",
-      ".mn-connection-card__name",
-      "h1"
-    );
+    const root = getDetailRoot();
+    const profileName =
+      getText(document, ".profile-detail__header-link") ||
+      getText(document, "h1") || "";
 
     const EXTRACTOR_MAP = {
       certifications:  () => extractCertifications(root),
@@ -662,8 +626,8 @@
       patents:         () => extractPatents(root),
     };
 
-    const extractor    = EXTRACTOR_MAP[section];
-    const data         = extractor ? extractor() : [];
+    const extractor = EXTRACTOR_MAP[section];
+    const data = extractor ? extractor() : [];
     const sectionLabel = section.charAt(0).toUpperCase() + section.slice(1);
 
     return {
@@ -671,44 +635,17 @@
       section,
       data,
       count:     data.length,
-      formatted: formatDetail(sectionLabel, data, profileName),
+      formatted: formatDetailSection(sectionLabel, data, profileName),
     };
   }
 
   // ─────────────────────────────────────────────────────────
-  // DEBUG HELPER — open DevTools console to see this output
+  // MESSAGE LISTENERS
   // ─────────────────────────────────────────────────────────
 
-  function debugDump() {
-    const root = getDetailRoot();
-    const info = {
-      url:              window.location.href,
-      mode:             detectMode(),
-      liTotal:          $qa(root, "li").length,
-      artdecoItems:     $qa(root, "li.artdeco-list__item").length,
-      pvsItems:         $qa(root, "li[class*='pvs-list__item']").length,
-      dataViewItems:    $qa(root, "li[data-view-name]").length,
-      getItemsResult:   getItems(root).length,
-      firstItemHTML:    getItems(root)[0]?.outerHTML?.slice(0, 400) || "(none)",
-    };
-    console.group("[LinkedIn Extractor] Debug Dump");
-    console.table(info);
-    console.groupEnd();
-    return info;
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // MESSAGE LISTENER
-  // ─────────────────────────────────────────────────────────
-
-  chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "detectMode") {
       sendResponse({ success: true, data: detectMode() });
-      return true;
-    }
-
-    if (request.action === "debug") {
-      sendResponse({ success: true, data: debugDump() });
       return true;
     }
 

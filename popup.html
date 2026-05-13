@@ -27,7 +27,6 @@
         color: var(--text);
         font-family: var(--sans);
         font-size: 13px;
-        /* height expands naturally with result panel */
       }
 
       /* ── HEADER ── */
@@ -68,7 +67,10 @@
       .mode-sub   { font-size: 10px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
       /* ── SECTION CHIPS ── */
-      .chips-wrap { margin: 10px 16px 0; display: none; }
+      .chips-wrap {
+        margin: 10px 16px 0;
+        display: none;
+      }
       .chips-wrap.visible { display: block; }
       .chips-label { font-family: var(--mono); font-size: 9px; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 6px; }
       .chips { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -111,89 +113,17 @@
       .spinner.visible { display: block; }
       @keyframes spin { to { transform: rotate(360deg); } }
 
-      /* ── RESULTS PANEL ── */
-      .results-panel {
-        display: none;
-        flex-direction: column;
-        margin: 0 16px 14px;
-        border: 1px solid var(--border);
-        border-radius: 10px;
-        overflow: hidden;
-        background: var(--surface);
+      /* ── SECONDARY BUTTONS ── */
+      .sec-row { display: flex; gap: 8px; }
+      .sec-btn {
+        flex: 1; padding: 8px; background: var(--surface);
+        border: 1px solid var(--border); border-radius: 8px;
+        color: var(--text); font-family: var(--sans); font-size: 11px; font-weight: 500;
+        cursor: pointer; display: none; align-items: center; justify-content: center; gap: 5px;
+        transition: all .2s;
       }
-      .results-panel.visible { display: flex; }
-
-      .results-toolbar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 7px 10px;
-        border-bottom: 1px solid var(--border);
-        background: rgba(255,255,255,.02);
-      }
-      .results-toolbar-left {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-family: var(--mono);
-        font-size: 9px;
-        color: var(--muted);
-        letter-spacing: .8px;
-      }
-      .results-dot {
-        width: 6px; height: 6px; border-radius: 50%;
-        background: var(--accent2);
-        box-shadow: 0 0 6px rgba(48,209,88,.5);
-      }
-      .results-toolbar-right { display: flex; gap: 5px; }
-
-      .tool-btn {
-        padding: 4px 9px;
-        border: 1px solid var(--border);
-        border-radius: 5px;
-        background: transparent;
-        color: var(--muted);
-        font-family: var(--sans);
-        font-size: 10px;
-        font-weight: 500;
-        cursor: pointer;
-        transition: all .15s;
-        display: flex;
-        align-items: center;
-        gap: 4px;
-      }
-      .tool-btn:hover { background: var(--border); color: var(--text); }
-      .tool-btn.copy-all {
-        border-color: rgba(10,132,255,.4);
-        color: var(--accent);
-        background: rgba(10,132,255,.08);
-      }
-      .tool-btn.copy-all:hover {
-        background: rgba(10,132,255,.18);
-        border-color: var(--accent);
-      }
-      .tool-btn.copied {
-        border-color: rgba(48,209,88,.5);
-        color: var(--accent2);
-        background: rgba(48,209,88,.08);
-      }
-
-      .results-pre {
-        font-family: var(--mono);
-        font-size: 8px;
-        line-height: 1.65;
-        color: #c8c8dc;
-        white-space: pre-wrap;
-        word-break: break-word;
-        padding: 10px 12px;
-        max-height: 220px;
-        overflow-y: auto;
-        scrollbar-width: thin;
-        scrollbar-color: var(--border) transparent;
-      }
-      .results-pre::-webkit-scrollbar { width: 4px; }
-      .results-pre::-webkit-scrollbar-track { background: transparent; }
-      .results-pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+      .sec-btn.visible { display: flex; }
+      .sec-btn:hover { background: var(--border); border-color: var(--accent); color: var(--accent); }
 
       /* ── FOOTER ── */
       .footer {
@@ -218,9 +148,9 @@
       <div class="header-row">
         <div class="logo">Li</div>
         <div class="app-name">PROFILE EXTRACTOR</div>
-        <div class="ver">v1.2</div>
+        <div class="ver">v1.1</div>
       </div>
-      <div class="tagline">Export LinkedIn profiles to clean text</div>
+      <div class="tagline">Export LinkedIn profiles to clean text files</div>
     </div>
 
     <!-- MODE BADGE -->
@@ -249,23 +179,13 @@
       <button class="extract-btn" id="extractBtn" disabled>
         <div class="spinner" id="spinner"></div>
         <span id="btnIcon">⬇</span>
-        <span id="btnText">EXTRACT</span>
+        <span id="btnText">EXTRACT & DOWNLOAD</span>
       </button>
-    </div>
 
-    <!-- RESULTS PANEL (shown after successful extract) -->
-    <div class="results-panel" id="resultsPanel">
-      <div class="results-toolbar">
-        <div class="results-toolbar-left">
-          <div class="results-dot"></div>
-          <span>EXTRACTED OUTPUT</span>
-        </div>
-        <div class="results-toolbar-right">
-          <button class="tool-btn" id="clearBtn">✕ Clear</button>
-          <button class="tool-btn copy-all" id="copyAllBtn">📋 Copy All</button>
-        </div>
+      <div class="sec-row">
+        <button class="sec-btn" id="previewBtn">👁 Preview</button>
+        <button class="sec-btn" id="copyBtn">📋 Copy</button>
       </div>
-      <pre class="results-pre" id="resultsPre"></pre>
     </div>
 
     <!-- FOOTER -->
