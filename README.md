@@ -111,4 +111,4 @@ linkedin-extractor/
 | `scripting`   | Inject content.js to scrape the page              |
 | `downloads`   | Save the extracted `.txt` file to your computer   |
 
-No data is sent anywhere — everything runs locally in your browser.
+No data is sent anywhere, everything runs locally in your browser.
