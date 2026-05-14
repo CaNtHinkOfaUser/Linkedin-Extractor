@@ -1,4 +1,10 @@
-// LinkedIn Extractor — Popup Script v1.4
+// LinkedIn Extractor — Popup Script v2.0
+// Fix: removed duplicate executeScript injection.
+// The manifest already declares content.js via content_scripts, so
+// calling executeScript again from the popup races and invalidates
+// the extension context, producing "chrome-extension://invalid/" errors.
+// Instead we just sendMessage directly, with a single safe retry if
+// the listener isn't ready yet (tab was open before extension loaded).
 
 // ─────────────────────────────────────────────
 // ELEMENT REFS
@@ -46,7 +52,6 @@ function setLoading(yes) {
   } else if (!extractionDone) {
     $btnText.textContent = currentMode === "detail" ? "EXTRACT THIS SECTION" : "EXTRACT";
   }
-  // If extractionDone, button already says "EXTRACT AGAIN" or "RETRY" — leave it.
 }
 
 function flashSuccess() {
@@ -84,20 +89,30 @@ function hideResults() {
 // ─────────────────────────────────────────────
 // MESSAGING
 // ─────────────────────────────────────────────
+// Sends a message to the content script.
+// If no listener is registered yet (tab was open before the extension
+// was installed/reloaded), we inject the script once and retry.
 async function sendToContent(tabId, action) {
-  try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
-  } catch (_) {}
-
-  // Small delay so freshly injected script registers its listener
-  await new Promise(r => setTimeout(r, 100));
-
-  return new Promise((resolve, reject) => {
+  const send = () => new Promise((resolve, reject) => {
     chrome.tabs.sendMessage(tabId, { action }, res => {
       if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
       else resolve(res);
     });
   });
+
+  try {
+    // First attempt — will work if content script is already running
+    return await send();
+  } catch (_) {
+    // Content script not running (pre-existing tab). Inject once then retry.
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+      await new Promise(r => setTimeout(r, 150)); // let the script register its listener
+      return await send();
+    } catch (err) {
+      throw new Error("Could not reach the page. Try reloading the LinkedIn tab.");
+    }
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -185,7 +200,6 @@ async function doExtract() {
 
     const result  = res.data;
     lastFormatted = result.formatted || "";
-
     showResults(lastFormatted);
 
     if (result.mode === "main") {
@@ -208,7 +222,7 @@ async function doExtract() {
     }
 
     flashSuccess();
-    extractionDone = true;
+    extractionDone       = true;
     $btnIcon.textContent = "↺";
     $btnText.textContent = "EXTRACT AGAIN";
 
@@ -217,9 +231,9 @@ async function doExtract() {
     $modeBadge.className   = "mode-badge mode-unknown";
     $modeLabel.textContent = "Extraction Failed";
     $modeSub.textContent   = err.message || "Reload the page and try again";
-    extractionDone = true; // prevent setLoading from clobbering these labels
-    $btnIcon.textContent = "⬇";
-    $btnText.textContent = "RETRY";
+    extractionDone         = true;
+    $btnIcon.textContent   = "⬇";
+    $btnText.textContent   = "RETRY";
   } finally {
     setLoading(false);
   }
