@@ -1,4 +1,4 @@
-// LinkedIn Profile Extractor — Content Script v8.1
+// LinkedIn Profile Extractor — Content Script v8.3
 // ── Accessibility-tree-first rewrite ────────────────────────────────
 //
 //  WHY v8.1 (root causes of v7.0 returning nothing):
@@ -172,18 +172,26 @@
   function itemFields(item) {
     if (!item) return [];
     const container = primaryContainer(item);
-    const spans = visibleAriaHiddenSpans(container);
-    if (spans.length >= 2) return dedupeSeq(spans);
-    // Too few spans from the chosen container — broaden to the whole item,
-    // which catches entries where the field cluster isn't under an anchor
-    // (tabbed recommendations, bare div entries on detail pages).
-    const itemSpans = visibleAriaHiddenSpans(item);
-    if (itemSpans.length > spans.length) return dedupeSeq(itemSpans);
-    if (spans.length) return dedupeSeq(spans);
+    let spans = visibleAriaHiddenSpans(container);
+    if (spans.length < 2) {
+      // Too few spans from the chosen container — broaden to the whole item,
+      // which catches entries where the field cluster isn't under an anchor
+      // (tabbed recommendations, bare div entries on detail pages).
+      const itemSpans = visibleAriaHiddenSpans(item);
+      if (itemSpans.length > spans.length) spans = itemSpans;
+    }
+    if (spans.length) {
+      // Strip noise: image filenames, section headings, "show/see more".
+      const cleaned = spans
+        .map(s => stripFilenameNoise(s))                 // drop *.jpg/*.png tokens
+        .map(s => clean(s))
+        .filter(s => s && !isNoiseField(s) && !JUNK.has(s.toLowerCase()))
+        .filter(s => !/^(show|see|view)\b/i.test(s) || s.length > 30);
+      return dedupeSeq(cleaned);
+    }
     // Last resort: visible text-node walk.
     const walked = visibleTextWalk(container);
-    if (walked.length) return walked;
-    return visibleTextWalk(item);
+    return walked.length ? walked : visibleTextWalk(item);
   }
 
   // Top-level item header line (company name for a multi-role experience item)
@@ -286,33 +294,161 @@
     const DRILL_RX = /\/(overlay|edit\/forms)\//;
     const drillAnchors = qa(root, 'a[href]').filter(a => DRILL_RX.test(a.getAttribute("href") || ""));
     if (drillAnchors.length) {
-      const seen = new Set();
-      const items = [];
-      for (const a of drillAnchors) {
-        // Walk up to the nearest ancestor that is a sibling-level entry block
-        // directly under a list-like wrapper inside root.
-        let node = a;
-        for (let up = a.parentElement; up && root.contains(up) && up !== root; up = up.parentElement) {
-          node = up;
-          const parent = node.parentElement;
-          if (parent && (parent === root || root.contains(parent)) &&
-              (node.innerText || "").length > 15) break;
-        }
-        if (node && !seen.has(node) && node !== root) {
-          seen.add(node);
-          items.push(node);
-        }
-      }
-      // De-duplicate nested picks: drop a pick that contains another pick
-      // (keep the more specific inner one) UNLESS it's meaningfully larger.
-      const flat = items.filter(it =>
-        !items.some(other => other !== it && it.contains(other) &&
-          (it.innerText || "").length > (other.innerText || "").length + 20));
-      if (flat.length) return { items: flat, via: "4-drill-anchor" };
+      const items = discoverItemsByAnchors(root, drillAnchors);
+      if (items.length) return { items, via: "4-drill-anchor" };
     }
 
     return { items: [], via: "none" };
   }
+
+  // ── Strategy 4 core: find entries via drill-down anchors ──────────
+  //  On detail pages (certs, honors, …) entries are bare <div>s with NO
+  //  role="listitem", NO <li>, NO role="list" wrapper. The one stable marker
+  //  is the drill-down <a>, whose URL carries a numeric entity id. LinkedIn
+  //  uses several shapes — all must resolve to the SAME id or grouping fails:
+  //    /overlay/715414005/skill-associations-details/    (id FIRST)
+  //    /overlay/Certifications/539964024/treasury/...    (word, then id)
+  //    /details/certifications/edit/forms/715414005/     (edit, then id)
+  //    /edit/forms/position/2825858466/                  (section-less edit)
+  //  The word segment is LETTERS-only ([a-z_-]*) — never `[^/]*`, which would
+  //  greedily eat leading digits when the id comes first. ≥4 digits filters
+  //  out /edit/forms/new/ and stray counters.
+  //
+  //  Algorithm (single-pass, robust to entries having 1 OR many anchors):
+  //    1. Extract ids, group anchors by id (drops id-less "Add" buttons).
+  //    2. For each id-group, find the ENTRY = nearest ancestor of any anchor
+  //       whose parent contains multiple text-bearing siblings (that's the
+  //       repeated entry block in the list). LCA is only used when a group
+  //       has ≥2 anchors, to avoid picking one anchor's narrow wrapper.
+  //    3. Dedupe entries by node identity (multiple ids may resolve to the
+  //       same entry only when anchors share a wrapper — rare). Order by DOM.
+  const ENTITY_ID_RX = /\/overlay\/[a-z_-]*\/?(\d{4,})|\/edit\/forms\/(?:[a-z_]+\/)?(\d{4,})/i;
+
+  function entityIdFromHref(href) {
+    const m = String(href || "").match(ENTITY_ID_RX);
+    if (!m) return "";
+    return m[1] || m[2] || "";
+  }
+
+  // Lowest Common Ancestor of a node set — used when a group has ≥2 anchors.
+  function lowestCommonAncestor(nodes) {
+    if (!nodes.length) return null;
+    const path = (n) => {
+      const p = [n]; let cur = n;
+      while (cur.parentElement) { cur = cur.parentElement; p.push(cur); }
+      return p;
+    };
+    const common = new Set(path(nodes[0]));
+    for (const n of nodes.slice(1)) {
+      const np = new Set(path(n));
+      let overlap = false;
+      for (const x of common) { if (np.has(x)) { overlap = true; break; } }
+      if (!overlap) return null;
+      for (const x of Array.from(common)) if (!np.has(x)) common.delete(x);
+      if (!common.size) return null;
+    }
+    let best = null, bestDepth = -1;
+    for (const x of common) {
+      let d = 0, c = x;
+      while (c.parentElement) { d++; c = c.parentElement; }
+      if (d > bestDepth) { bestDepth = d; best = x; }
+    }
+    return best;
+  }
+
+  // Walk one node up until its parent contains ≥2 text-bearing children —
+  // i.e. until this node sits among repeated sibling entries. Returns null
+  // if we hit root first. This finds the ENTRY for a single anchor without
+  // needing LCA (which collapses to the anchor itself for singletons).
+  function promoteToEntry(node, root) {
+    if (!node || node === root) return null;
+    for (let cur = node; cur && cur !== root; cur = cur.parentElement) {
+      const parent = cur.parentElement;
+      if (!parent || parent === root) break;
+      const sibs = Array.from(parent.children).filter(c =>
+        c.nodeType === 1 && (c.innerText || "").trim().length > 5);
+      // cur is one of several entry-shaped siblings → cur is an entry.
+      if (sibs.length >= 2 && sibs.includes(cur)) return cur;
+    }
+    // Fallback: return the deepest non-anchor, non-root ancestor with text.
+    let best = null;
+    for (let cur = node; cur && cur !== root; cur = cur.parentElement) {
+      if (cur.tagName === "A" || cur.tagName === "IMG" || cur.tagName === "BUTTON") continue;
+      if ((cur.innerText || "").trim().length >= 5) { best = cur; break; }
+    }
+    return best;
+  }
+
+  function discoverItemsByAnchors(root, drillAnchors) {
+    // 1) Group anchors by entity id (drops id-less "Add new" buttons).
+    const byId = new Map();
+    for (const a of drillAnchors) {
+      const id = entityIdFromHref(a.getAttribute("href") || "");
+      if (!id) continue;
+      if (!byId.has(id)) byId.set(id, []);
+      byId.get(id).push(a);
+    }
+    if (!byId.size) return [];
+
+    // 2) One entry per id-group.
+    const entryById = new Map();   // id → entry node (for diagnostics)
+    const entries = [];
+    for (const [id, anchors] of byId) {
+      let seed = anchors.length >= 2 ? lowestCommonAncestor(anchors) : anchors[0];
+      if (!seed || seed === root) continue;
+      const entry = promoteToEntry(seed, root);
+      if (!entry || entry === root) continue;
+      entryById.set(id, entry);
+      entries.push(entry);
+    }
+    if (!entries.length) return [];
+
+    // 3) Dedupe by node identity (distinct ids rarely share an entry, but
+    //    guard anyway). Then sort in DOM order.
+    const unique = [];
+    const seen = new Set();
+    for (const e of entries) {
+      if (seen.has(e)) continue;
+      seen.add(e);
+      unique.push(e);
+    }
+    unique.sort((a, b) => {
+      if (a === b) return 0;
+      const rel = a.compareDocumentPosition(b);
+      if (rel & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (rel & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+    return unique;
+  }
+
+  // True for fields that are noise (image filenames, section headings).
+  function isNoiseField(s) {
+    const t = clean(s).toLowerCase();
+    if (IMAGE_FILE_RX.test(t)) return true;
+    if (SECTION_HEADING_SET.has(t)) return true;
+    return false;
+  }
+
+  // Strip image-filename tokens (foo.jpg, bar.png) from a field. These leak
+  // in because LinkedIn names credential/award images after their content and
+  // exposes the filename as an aria-hidden span. Pure-filename fields become
+  // empty so the downstream filter drops them; embedded filenames are removed
+  // and the rest of the line is kept.
+  function stripFilenameNoise(s) {
+    if (!s) return s;
+    const stripped = String(s).replace(/\b[\w.-]+\.(jpe?g|png|gif|webp|svg|bmp|tiff?|heic)\b/gi, "");
+    return stripped;
+  }
+
+  const IMAGE_FILE_RX = /\.(jpe?g|png|gif|webp|svg|bmp|tiff?|heic)$/i;
+  const SECTION_HEADING_SET = new Set([
+    "licenses & certifications", "licenses and certifications",
+    "experience", "education", "skills", "about", "honors & awards",
+    "honors and awards", "honors", "awards", "publications", "projects",
+    "volunteer experience", "volunteering", "languages", "courses",
+    "recommendations", "organizations", "patents", "interests",
+  ]);
 
   function getItems(root) {
     return getItemsDebug(root).items;
@@ -573,22 +709,60 @@
     });
   }
 
+  // Split a combined "Issued by <Issuer> · <Month Year>" field into parts.
+  // Real example from debug: "Issued by PerseCoding · Feb 2026"
+  function splitIssuedField(s) {
+    const out = { issuer: "", issued: "" };
+    if (!s) return out;
+    const parts = clean(s).split(/\s*·\s*/);
+    for (const p of parts) {
+      if (!out.issued && (MONTH_YEAR_RX.test(p) || /^\d{4}$/.test(p))) out.issued = p;
+      else if (/issued\s+by/i.test(p)) out.issuer = clean(p.replace(/^issued\s+by/i, ""));
+      else if (out.issuer && MONTH_YEAR_RX.test(p) && !out.issued) out.issued = p;
+    }
+    // Fallback: whole string minus "Issued by" prefix as issuer if no date matched
+    if (!out.issuer && !out.issued && /issued\s+by/i.test(s)) {
+      out.issuer = clean(s.replace(/^.*?issued\s+by/i, "").split(/\s*·\s*/)[0]);
+    }
+    return out;
+  }
+  const MONTH_YEAR_RX = /^([A-Z][a-z]{2,8}\.?\s+\d{4}|\d{4})$/;
+
   function extractCertifications(root) {
     root = root || findSection("certifications");
     if (!root) return [];
+    const seen = new Set();
     return getItems(root).map(item => {
       const fields = itemFields(item);
-      let issued = "", expiry = "", credentialId = "";
+      let issued = "", expiry = "", credentialId = "", issuer = "";
       const rest = fields.filter(s => {
-        if (ISSUED_RX.test(s) && !issued)         { issued = s; return false; }
+        // Combined "Issued by X · Date" — split it.
+        if (ISSUED_RX.test(s) && !issued) {
+          if (/issued\s+by/i.test(s)) {
+            const sp = splitIssuedField(s);
+            issuer = sp.issuer; issued = sp.issued;
+          } else {
+            issued = s;
+          }
+          return false;
+        }
         if (EXPIRY_RX.test(s) && !expiry)         { expiry = s; return false; }
         if (CRED_RX.test(s) && !credentialId)     { credentialId = s.replace(/credential\s*id[:\s]*/i, "").trim(); return false; }
         if (/^(show|see|view)\s/i.test(s) && s.length < 30) return false;
         return true;
       });
       const url = externalUrl(item);
-      return { name: rest[0] || "", issuer: rest[1] || "", issued, expiry, credentialId, url };
-    }).filter(e => e.name);
+      const name = rest[0] || "";
+      // issuer may already be set from the combined field; otherwise rest[1].
+      const finalIssuer = issuer || rest[1] || "";
+      // Description = longest remaining non-name, non-issuer line.
+      const desc = rest.slice(finalIssuer && rest[1] === finalIssuer ? 2 : 1)
+        .find(s => s.length >= 30 && !/^associated with/i.test(s)) || "";
+      return { name, issuer: finalIssuer, issued, expiry, credentialId, url, description: desc };
+    }).filter(e => {
+      if (!e.name || seen.has(e.name)) return false;
+      seen.add(e.name); return true;
+    });
   }
 
   function extractProjects(root) {
@@ -629,10 +803,32 @@
   function extractHonors(root) {
     root = root || findSection("honors");
     if (!root) return [];
+    const seen = new Set();
     return getItems(root).map(item => {
       const f = itemFields(item);
-      return { title: f[0] || "", issuer: f[1] || "", date: f[2] || "", description: pickDescription(f.slice(3), 40) };
-    }).filter(e => e.title);
+      let issuer = "", date = "";
+      // LinkedIn collapses issuer+date into one "Issued by X · Date" line for
+      // honors just as it does for certs. Split it before positional parse.
+      const rest = f.filter(s => {
+        if (!issuer && /issued\s+by/i.test(s)) {
+          const sp = splitIssuedField(s);
+          issuer = sp.issuer; date = date || sp.issued;
+          return false;
+        }
+        if (!date && (MONTH_YEAR_RX.test(s) || isDate(s) || /^\d{4}$/.test(s))) {
+          date = s; return false;
+        }
+        return true;
+      });
+      const title = rest[0] || "";
+      // If issuer wasn't in an "Issued by" line, rest[1] is it.
+      const finalIssuer = issuer || rest[1] || "";
+      const desc = rest.slice(finalIssuer && rest[1] === finalIssuer ? 2 : 1)
+        .find(s => s.length >= 30 && !/^associated with/i.test(s)) || "";
+      const e = { title, issuer: finalIssuer, date, description: desc };
+      if (!e.title || seen.has(e.title)) return null;
+      seen.add(e.title); return e;
+    }).filter(Boolean);
   }
 
   function extractPublications(root) {
@@ -821,7 +1017,7 @@
     let result;
     for (let i = 0; i < MAX; i++) {
       if (i > 0) {
-        console.log(`[Li Extractor v8.1] Retry ${i}/${MAX-1} — scrolling + waiting ${DELAY}ms`);
+        console.log(`[Li Extractor v8.3] Retry ${i}/${MAX-1} — scrolling + waiting ${DELAY}ms`);
         await scrollToBottom();
         await expandSeeMore(document);
         await sleep(DELAY);
@@ -844,7 +1040,7 @@
     const root  = mode.mode === "detail" ? getDetailRoot() : (findSection("experience") || findSection("certifications") || main);
     const { items, via } = getItemsDebug(root);
 
-    console.group("[Li Extractor v8.1] Debug");
+    console.group("[Li Extractor v8.3] Debug");
     console.log("URL:", window.location.href);
     console.log("Mode:", mode);
 
@@ -913,7 +1109,7 @@
       extractWithRetry(mode, section)
         .then(result => sendResponse({ success:true, data:result }))
         .catch(err => {
-          console.error("[LinkedIn Extractor v8.1]", err);
+          console.error("[LinkedIn Extractor v8.3]", err);
           sendResponse({ success:false, error:err.message });
         });
       return true;
@@ -921,6 +1117,6 @@
   };
 
   chrome.runtime.onMessage.addListener(window.__liExtractHandler);
-  console.log("[LinkedIn Extractor v8.1] Ready —", window.location.pathname);
+  console.log("[LinkedIn Extractor v8.3] Ready —", window.location.pathname);
 
 })();
