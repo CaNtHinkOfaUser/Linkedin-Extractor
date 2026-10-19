@@ -63,10 +63,22 @@
 
       .dl-row { display:none; gap:6px; }
       .dl-row.visible { display:flex; }
-      .dl-btn { flex:1; padding:9px; border:1px solid rgba(48,209,88,.4); border-radius:8px; background:rgba(48,209,88,.08); color:var(--accent2); font-family:var(--mono); font-size:11px; font-weight:700; cursor:pointer; transition:all .15s; }
+      .dl-btn { flex:1; padding:9px 4px; border:1px solid rgba(48,209,88,.4); border-radius:8px; background:rgba(48,209,88,.08); color:var(--accent2); font-family:var(--mono); font-size:10px; font-weight:700; white-space:nowrap; cursor:pointer; transition:all .15s; }
       .dl-btn:hover { background:rgba(48,209,88,.18); border-color:var(--accent2); }
       .dl-btn.secondary { border-color:var(--border); background:transparent; color:var(--muted); }
       .dl-btn.secondary:hover { background:var(--border); color:var(--text); }
+
+      .choose { margin:12px 16px 0; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:9px 10px 8px; }
+      .choose.disabled { opacity:.5; pointer-events:none; }
+      .choose-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
+      .choose-title { font-family:var(--mono); font-size:9px; color:var(--muted); letter-spacing:1px; text-transform:uppercase; }
+      .choose-links { display:flex; gap:8px; }
+      .link-btn { border:none; background:none; padding:0; color:var(--accent); font-family:var(--sans); font-size:10px; cursor:pointer; }
+      .link-btn:hover { text-decoration:underline; }
+      .choose-grid { display:grid; grid-template-columns:1fr 1fr; gap:2px 8px; }
+      .opt { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text); padding:2px 0; cursor:pointer; user-select:none; }
+      .opt input { accent-color:var(--accent); margin:0; cursor:pointer; }
+      .opt.sub { grid-column:1 / -1; color:var(--muted); font-size:10px; padding-left:18px; }
 
       .warn { display:none; margin:10px 16px 0; font-size:10px; line-height:1.5; color:var(--gold); }
       .warn.visible { display:block; }
@@ -99,9 +111,9 @@
       <div class="header-row">
         <div class="logo">Li</div>
         <div class="app-name">PROFILE EXTRACTOR</div>
-        <div class="ver">v2.0</div>
+        <div class="ver">v2.1</div>
       </div>
-      <div class="tagline">Export full LinkedIn profiles to text or JSON</div>
+      <div class="tagline">Export LinkedIn profiles to clean text</div>
     </div>
 
     <div class="mode-badge mode-unknown" id="modeBadge">
@@ -122,22 +134,33 @@
       <div class="chips" id="chipsGrid"></div>
     </div>
 
+    <div class="choose" id="choose">
+      <div class="choose-head">
+        <div class="choose-title">Sections to extract</div>
+        <div class="choose-links">
+          <button class="link-btn" id="selAll">All</button>
+          <button class="link-btn" id="selNone">None</button>
+        </div>
+      </div>
+      <div class="choose-grid" id="chooseGrid"></div>
+    </div>
+
     <div class="warn" id="warn"></div>
 
     <div class="tip" id="tip">
-      💡 Opens every "Show all" page (all skills, certifications, awards…) in an overlay on this tab.
-      Keep the tab in front until it finishes, usually about a minute. The .txt downloads automatically.
+      💡 Reads every "Show all" page (all skills, certifications, awards…) behind a progress card on this tab.
+      Keep the tab in front until it finishes. Fewer sections = faster.
     </div>
 
     <div class="body">
       <button class="extract-btn" id="extractBtn" disabled>
         <div class="spinner" id="spinner"></div>
         <span id="btnIcon">⬇</span>
-        <span id="btnText">EXTRACT FULL PROFILE</span>
+        <span id="btnText">EXTRACT</span>
       </button>
       <div class="dl-row" id="dlRow">
-        <button class="dl-btn" id="dlTxtBtn">⬇ .TXT</button>
-        <button class="dl-btn" id="dlJsonBtn">⬇ .JSON</button>
+        <button class="dl-btn" id="dlTxtBtn" title="Save as a .txt file">⬇ Download</button>
+        <button class="dl-btn" id="copyBtn">📋 Copy text</button>
         <button class="dl-btn secondary" id="previewBtn">Preview</button>
       </div>
     </div>

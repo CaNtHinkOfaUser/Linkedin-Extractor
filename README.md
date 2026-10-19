@@ -1,6 +1,6 @@
 # LinkedIn Profile Extractor — Chrome Extension
 
-Extract an entire LinkedIn profile, every section and every entry, into a clean `.txt` file (and `.json`) with one click.
+Extract a LinkedIn profile into a clean `.txt` file: every section and every entry, or just the sections you pick.
 
 ---
 
@@ -50,12 +50,11 @@ After pulling a new version, click the reload ↻ icon on the extension card **a
 ## How to Use
 
 1. Sign in to LinkedIn and open any profile: `linkedin.com/in/username` (a `/details/…` page of that profile works too)
-2. Click the extension icon → **EXTRACT FULL PROFILE**
-3. An overlay appears on the tab and loads each section's page in turn. **Keep the tab in front** until it finishes, usually 1–2 minutes. LinkedIn only loads more entries while the page is visible, so the extractor pauses if you switch tabs.
-4. When it finishes, `firstname-lastname_YYYY-MM-DD.txt` downloads automatically
-5. Reopen the popup any time to download the last extract again as **.TXT** or **.JSON**, preview it, or copy it
+2. Click the extension icon and tick the sections you want under **Sections to extract** (All / None to toggle quickly; your choice is remembered). Untick *Tag each skill's category* if you don't need categories — it's the slowest part.
+3. Click **Extract**. A progress card covers the tab while the pages load behind it, several at once. **Keep the tab in front** until it finishes; LinkedIn only loads more entries while the page is visible, so the extractor pauses if you switch tabs. Fewer sections finish faster.
+4. When it's done, click **⬇ Download** to save `firstname-lastname_YYYY-MM-DD.txt`, or **📋 Copy text** to copy it. **Preview** shows it in the popup.
 
-You can close the popup while it runs; the extraction continues on the page. **Cancel** in the overlay stops it.
+You can close the popup while it runs; the extraction continues on the page, and the result is waiting when you reopen the popup. **Cancel** on the card stops it.
 
 ---
 
@@ -64,10 +63,10 @@ You can close the popup while it runs; the extraction continues on the page. **C
 ```
 linkedin-extractor/
 ├── manifest.json      # Chrome Extension manifest (v3)
-├── content.js         # Scraper — runs on linkedin.com/in/*, drives the overlay
-├── background.js      # Service worker — saves the .txt / .json download
+├── content.js         # Scraper — runs on linkedin.com/in/*, drives the progress card
+├── background.js      # Service worker — saves the .txt download
 ├── popup.html         # Extension popup UI
-├── popup.js           # Popup logic: start, progress, download buttons
+├── popup.js           # Popup logic: section picker, start, progress, download/copy
 ├── icons/
 └── README.md
 ```
@@ -80,7 +79,7 @@ linkedin-extractor/
 |---------------|-------------------------------------------------------------|
 | `activeTab`   | Read the current LinkedIn tab                               |
 | `scripting`   | Inject content.js into tabs opened before the extension     |
-| `downloads`   | Save the extracted `.txt` / `.json` file                    |
-| `storage`     | Keep the last extract so the popup can re-download it       |
+| `downloads`   | Save the extracted `.txt` file when you click Download      |
+| `storage`     | Keep the last extract and your section choices              |
 
 No data is sent anywhere. Everything runs locally in your browser.

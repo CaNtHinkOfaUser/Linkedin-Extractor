@@ -4,15 +4,16 @@
 // profile only previews each section ("Show all 97 skills →"), and the full
 // lists live on /in/<id>/details/<section>/ pages that lazy-load ten entries
 // at a time as the end of the list scrolls into a *visible* viewport. So
-// extractAll() opens an overlay on the current tab holding a same-origin
-// <iframe>, and in it:
-//   1. loads the profile, scrolls until every section card has rendered and
-//      reads the header, About and each section's preview,
-//   2. loads every section's details page, scrolls / clicks "Load more" until
-//      the list stops growing, then re-reads the full list (skills are also
-//      re-read per category tab to tag each skill with its category),
-//   3. loads the contact-info overlay.
-// The result is stored in chrome.storage.local and background.js downloads it.
+// extractAll() covers the current tab with a progress card and, in
+// same-origin iframes stacked behind it, loads (for the sections the user
+// chose):
+//   • the profile itself — scrolled until every section card has rendered,
+//     for the header, About, each section's preview and its entry count,
+//   • each section's details page, several at once — scrolled / "Load more"
+//     clicked until the list stops growing (skills are also re-read per
+//     category tab to tag each skill with its category),
+//   • the contact-info overlay.
+// The text is stored in chrome.storage.local; the popup downloads or copies it.
 //
 // Markup notes (LinkedIn's 2025+ React profile): class names are hashed per
 // deploy, so nothing here keys on classes. Stable hooks:
@@ -27,7 +28,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.0.0";
+  const VERSION = "2.1.0";
   const hasExt = typeof chrome !== "undefined" && !!(chrome.runtime && chrome.runtime.id);
 
   if (hasExt && window.__liExtractHandler) {
@@ -827,7 +828,11 @@
   // ─────────────────────────────────────────────────────────────
   // OVERLAY + IFRAME LOADING
   // ─────────────────────────────────────────────────────────────
-  const NOTE = "Keep this tab in front while it runs. LinkedIn only loads more entries while the page is visible.";
+  // Pages load in full-size iframes stacked *behind* an opaque progress
+  // card. They have to stay inside the viewport (LinkedIn's lazy loading
+  // only fires for content intersecting a visible viewport, and occlusion
+  // doesn't count against that), but nobody needs to watch them.
+  const NOTE = "Keep this tab in front until it finishes. LinkedIn only loads while the page is visible.";
 
   function el(doc, tag, props = {}, kids = []) {
     const e = doc.createElement(tag);
@@ -844,50 +849,76 @@
     const host = el(document, "div", { "data-li-extractor": "", style: "all:initial;position:fixed;inset:0;z-index:2147483647;" });
     const shadow = host.attachShadow({ mode: "open" });
     const css = `
-      .backdrop{position:fixed;inset:0;background:rgba(5,8,15,.72)}
-      .panel{position:fixed;inset:3vh 3vw;display:flex;flex-direction:column;background:#0a0a0f;border:1px solid #1e1e2e;border-radius:12px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.5);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#e8e8f0}
-      .bar{display:flex;align-items:center;gap:14px;padding:12px 16px;border-bottom:1px solid #1e1e2e;background:linear-gradient(135deg,#0a1628,#0f1f3d)}
+      .stage{position:fixed;inset:0;overflow:hidden}
+      .stage iframe{position:absolute;inset:0;width:100%;height:100%;border:0;pointer-events:none}
+      .backdrop{position:fixed;inset:0;background:#05080f}
+      .card{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(380px,calc(100vw - 32px));max-height:calc(100vh - 32px);display:flex;flex-direction:column;background:#0a0a0f;border:1px solid #1e1e2e;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.5);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#e8e8f0;overflow:hidden}
+      .head{display:flex;align-items:center;gap:10px;padding:14px 16px 10px;background:linear-gradient(135deg,#0a1628,#0f1f3d)}
       .logo{width:26px;height:26px;border-radius:6px;background:#0a84ff;color:#fff;font:700 10px/26px monospace;text-align:center;flex:none}
-      .info{flex:1;min-width:0}
-      .step{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-      .note{font-size:11px;color:#8e8ea8;margin-top:2px}
-      .track{height:4px;background:#1e1e2e;border-radius:2px;margin-top:8px;overflow:hidden}
-      .fill{height:100%;width:0;background:#0a84ff;transition:width .3s}
-      button{flex:none;background:transparent;color:#e8e8f0;border:1px solid #3a3a52;border-radius:6px;padding:6px 12px;font:inherit;cursor:pointer}
+      .title{flex:1;min-width:0;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      button{flex:none;background:transparent;color:#e8e8f0;border:1px solid #3a3a52;border-radius:6px;padding:5px 10px;font:inherit;font-size:12px;cursor:pointer}
       button:hover{background:#1e1e2e}
-      .frame{flex:1;position:relative;background:#fff}
-      iframe{position:absolute;inset:0;width:100%;height:100%;border:0;pointer-events:none}`;
-    const step = el(document, "div", { class: "step", text: "Starting…" });
-    const note = el(document, "div", { class: "note", text: NOTE });
-    const fill = el(document, "div", { class: "fill" });
+      .track{height:4px;background:#1e1e2e;margin:0 16px;border-radius:2px;overflow:hidden}
+      .fill{height:100%;width:0;background:#0a84ff;transition:width .3s}
+      .status{padding:8px 16px 4px;font-size:12px;color:#c8c8dc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .rows{padding:4px 16px 8px;overflow:auto}
+      .row{display:flex;justify-content:space-between;gap:12px;padding:3px 0;font-size:12px;border-bottom:1px solid #14141e}
+      .row .v{font-variant-numeric:tabular-nums;white-space:nowrap}
+      .row.pending{color:#6e6e8a}
+      .row.active .v{color:#0a84ff}
+      .row.done .v{color:#30d158}
+      .row.skip{color:#6e6e8a}
+      .row.error .v{color:#f5a623}
+      .note{padding:8px 16px 12px;font-size:11px;color:#8e8ea8}`;
+    const title = el(document, "div", { class: "title", text: "Extracting profile…" });
     const cancel = el(document, "button", { type: "button", text: "Cancel" });
-    const frameHost = el(document, "div", { class: "frame" });
+    const fill = el(document, "div", { class: "fill" });
+    const status = el(document, "div", { class: "status", text: "Starting…" });
+    const rows = el(document, "div", { class: "rows" });
+    const note = el(document, "div", { class: "note", text: NOTE });
+    const stage = el(document, "div", { class: "stage" });
     shadow.append(
       el(document, "style", { text: css }),
+      stage,
       el(document, "div", { class: "backdrop" }),
-      el(document, "div", { class: "panel" }, [
-        el(document, "div", { class: "bar" }, [
-          el(document, "div", { class: "logo", text: "Li" }),
-          el(document, "div", { class: "info" }, [step, note, el(document, "div", { class: "track" }, [fill])]),
-          cancel,
-        ]),
-        frameHost,
+      el(document, "div", { class: "card", role: "dialog", "aria-label": "LinkedIn Profile Extractor" }, [
+        el(document, "div", { class: "head" }, [el(document, "div", { class: "logo", text: "Li" }), title, cancel]),
+        el(document, "div", { class: "track" }, [fill]),
+        status,
+        rows,
+        note,
       ]),
     );
     cancel.addEventListener("click", () => { cancel.disabled = true; cancel.textContent = "Cancelling…"; onCancel(); });
     (document.body || document.documentElement).appendChild(host);
+    const rowEls = new Map();
     return {
-      step(text, frac) {
-        step.textContent = text;
+      title(text) { title.textContent = text; },
+      status(text, frac) {
+        status.textContent = text;
         if (frac != null) fill.style.width = `${Math.round(Math.max(0, Math.min(1, frac)) * 100)}%`;
       },
+      row(key, label, value, state) {
+        let r = rowEls.get(key);
+        if (!r) {
+          r = el(document, "div", { class: "row" }, [el(document, "span"), el(document, "span", { class: "v" })]);
+          rows.appendChild(r);
+          rowEls.set(key, r);
+        }
+        r.className = `row ${state}`;
+        r.firstChild.textContent = label;
+        r.lastChild.textContent = value;
+      },
       note(text) { note.textContent = text || NOTE; },
-      setFrame(f) { frameHost.replaceChildren(f); },
+      addFrame(f) { stage.appendChild(f); },
       remove() { host.remove(); },
     };
   }
 
-  function checkCancel(ctx) { if (ctx.cancelled) throw new Error("Cancelled"); }
+  // A job context may hang off the extraction's root context; cancelling
+  // either one stops it.
+  const isCancelled = ctx => !!(ctx.cancelled || (ctx.parent && ctx.parent.cancelled));
+  function checkCancel(ctx) { if (isCancelled(ctx)) throw new Error("Cancelled"); }
 
   async function waitVisible(ctx) {
     if (!document.hidden) return;
@@ -896,25 +927,43 @@
     ctx.overlay.note();
   }
 
-  // Load `url` in a fresh iframe and resolve with its document once
-  // isReady(doc, elapsedMs) is true.
-  async function openPage(ctx, url, isReady, timeout = 30000) {
+  // Load `url` in its own iframe, wait until isReady(doc, elapsedMs), run
+  // fn(doc), and always remove the frame afterwards.
+  async function withPage(ctx, url, isReady, fn, timeout = 30000) {
     const frame = el(document, "iframe", { src: url, tabindex: "-1", "aria-hidden": "true" });
-    ctx.overlay.setFrame(frame);
-    const t0 = Date.now();
-    let doc = null;
-    while (Date.now() - t0 < timeout) {
-      checkCancel(ctx);
-      await waitVisible(ctx);
-      await sleep(300);
-      try { doc = frame.contentDocument; } catch (_) { doc = null; }
-      if (!doc || !doc.URL.startsWith(location.origin) || doc.readyState === "loading") continue;
-      const path = new URL(doc.URL).pathname;
-      if (/^\/(authwall|login|checkpoint|uas\/login)/.test(path)) throw new Error("LinkedIn asked you to sign in again.");
-      if (isReady(doc, Date.now() - t0)) { await sleep(500); return doc; }
+    ctx.overlay.addFrame(frame);
+    try {
+      const t0 = Date.now();
+      let doc = null, ready = false;
+      while (Date.now() - t0 < timeout) {
+        checkCancel(ctx);
+        await waitVisible(ctx);
+        await sleep(200);
+        try { doc = frame.contentDocument; } catch (_) { doc = null; }
+        if (!doc || !doc.URL.startsWith(location.origin) || doc.readyState === "loading") continue;
+        if (/^\/(authwall|login|checkpoint|uas\/login)/.test(new URL(doc.URL).pathname)) throw new Error("LinkedIn asked you to sign in again.");
+        if (isReady(doc, Date.now() - t0)) { ready = true; break; }
+      }
+      if (!doc || !doc.URL.startsWith(location.origin)) throw new Error("Page took too long to load");
+      if (ready) await sleep(300);
+      return await fn(doc);
+    } finally {
+      frame.remove();
     }
-    if (doc && doc.URL.startsWith(location.origin)) return doc;
-    throw new Error("Page took too long to load");
+  }
+
+  // Run async jobs at most `limit` at a time, in the order they were added.
+  function makePool(limit) {
+    let active = 0;
+    const queue = [];
+    const next = () => {
+      while (active < limit && queue.length) {
+        const { fn, resolve, reject } = queue.shift();
+        active++;
+        Promise.resolve().then(fn).then(resolve, reject).finally(() => { active--; next(); });
+      }
+    };
+    return { run: fn => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); }) };
   }
 
   function findScroller(d) {
@@ -953,8 +1002,11 @@
 
   // Keep nudging the end of the list into view (and clicking "Load more")
   // until the list stops growing or reaches the count LinkedIn advertised.
-  async function loadAll(ctx, d, getContainer, { expected = 0, sel, onCount } = {}) {
+  // `expected` may be a function: the count can arrive from the profile
+  // page while this list is already loading.
+  async function loadAll(ctx, d, getContainer, { expected: exp = 0, sel, onCount } = {}) {
     const scroller = findScroller(d);
+    const expectedNow = () => (typeof exp === "function" ? exp() : exp) || 0;
     const sig = () => {
       const c = getContainer();
       return c ? `${findEntries(c, sel).length}|${(c.textContent || "").length}` : "";
@@ -967,7 +1019,7 @@
       if (!c) break;
       const n = findEntries(c, sel).length;
       if (onCount) onCount(n);
-      if (expected && n >= expected) break;
+      if (expectedNow() && n >= expectedNow()) break;
       const before = sig();
       const clicked = clickLoadMore(c.closest("section") || c);
       scroller.scrollTop -= 300;
@@ -977,7 +1029,10 @@
       for (let i = 0; i < 12 && !changed; i++) { await sleep(250); changed = sig() !== before; }
       if (changed) { idle = 0; continue; }
       // Short lists (< one page of 10) rarely have more; don't wait long.
-      if (++idle >= (clicked ? 2 : n < 8 && !expected ? 1 : 3)) break;
+      // When LinkedIn has said more entries exist, be more patient: with
+      // several pages loading at once a batch can take a while.
+      const limit = clicked ? 2 : expectedNow() > n ? 5 : n < 8 ? 1 : 3;
+      if (++idle >= limit) break;
     }
     scroller.scrollTop = 0;
   }
@@ -1005,8 +1060,9 @@
   // rest (Skills onwards) in batches as a trigger near the end of the list
   // scrolls into view. Jumping straight to the bottom skips past that
   // trigger, so step down a screen at a time (centring any skeleton) until
-  // the bottom stops growing.
-  async function loadProfileSections(ctx, d) {
+  // the bottom stops growing. onRound() runs every step so sections can be
+  // picked up as they appear; returning true stops early.
+  async function loadProfileSections(ctx, d, onRound = () => false) {
     const scroller = findScroller(d);
     const skeletons = () => qa(d, "main section").filter(s => !s.querySelector("h2") && !(s.textContent || "").trim());
     const count = () => `${qa(d, "main h2").length}|${skeletons().length}`;
@@ -1015,6 +1071,7 @@
     for (let round = 0; round < 80 && idle < 2; round++) {
       checkCancel(ctx);
       await waitVisible(ctx);
+      if (onRound()) break;
       const before = count();
       const pending = skeletons();
       if (pending.length) scrollToEl(scroller, pending[0], "center");
@@ -1064,7 +1121,7 @@
     const out = [];
     for (const tab of tabs) {
       checkCancel(ctx);
-      report(`${cfg.label}: ${tab.name}`);
+      report(`${tab.name}…`);
       if (!tab.active()) { tab.el.click(); await sleep(1800); }
       await loadAll(ctx, d, () => detailsList(d));
       await expandAll(detailsList(d));
@@ -1100,7 +1157,7 @@
       checkCancel(ctx);
       const b = button(cat);
       if (!b) continue;
-      report(`Skills: ${cat}`);
+      report(`categories: ${cat}…`);
       // Wait for the old list to be replaced before reading, or every skill
       // still on screen would be tagged with this category.
       const first = rows()[0];
@@ -1122,20 +1179,23 @@
   }
 
   async function scrapeDetails(ctx, item, report) {
-    const { cfg, url, expected } = item;
-    const d = await openPage(ctx, url, detailsReady);
-    if (cfg.tabField) return scrapeTabbed(ctx, d, cfg, url, report);
-    await loadAll(ctx, d, () => detailsList(d), {
-      expected,
-      onCount: n => report(`${cfg.label}: ${n}${expected ? ` of ${expected}` : ""} loaded`),
+    const { cfg, url, expected, categories } = item;
+    return withPage(ctx, url, detailsReady, async d => {
+      if (cfg.tabField) return scrapeTabbed(ctx, d, cfg, url, report);
+      await loadAll(ctx, d, () => detailsList(d), {
+        expected,
+        onCount: n => { const e = expected(); report(e ? `${n} / ${e}` : `${n}`); },
+      });
+      await expandAll(detailsList(d));
+      ensureOn(d, url);
+      const entries = parseEntries(cfg, detailsList(d));
+      // A short list gets re-loaded at the end anyway; tag categories then.
+      const complete = !expected() || entries.length >= expected();
+      if (cfg.key === "skills" && categories && entries.length && complete) {
+        try { await tagSkillCategories(ctx, d, entries, report); } catch (e) { if (isCancelled(ctx)) throw e; }
+      }
+      return entries;
     });
-    await expandAll(detailsList(d));
-    ensureOn(d, url);
-    const entries = parseEntries(cfg, detailsList(d));
-    if (cfg.key === "skills" && entries.length) {
-      try { await tagSkillCategories(ctx, d, entries, report); } catch (e) { if (ctx.cancelled) throw e; }
-    }
-    return entries;
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -1146,97 +1206,231 @@
     return m ? decodeURIComponent(m[1]) : "";
   }
 
-  async function extractAll(onProgress = () => {}) {
+  // Everything the popup can tick. "header", "contact" and "about" aren't
+  // list sections, so they live outside SECTIONS.
+  const ALL_KEYS = ["header", "contact", "about", ...SECTIONS.map(s => s.key)];
+
+  // How many "Show all" pages load at once (on top of the profile page).
+  const PARALLEL = 3;
+  // Longest lists first so they aren't the last thing still running; rare
+  // sections last, by which time the profile page has said whether they exist.
+  const JOB_ORDER = [
+    "skills", "certifications", "honors", "experience", "projects", "education", "volunteering",
+    "recommendations", "interests", "courses", "testScores", "languages", "publications", "patents", "organizations",
+  ];
+
+  // Read the profile page itself: header, About, and a preview of each
+  // chosen section (the fallback if its "Show all" page comes back empty).
+  function parseProfilePage(doc, want) {
+    const out = { header: parseHeader(doc), about: "", topSkills: [], previews: {} };
+    if (!out.header.name) out.header.name = doc.title.replace(/^\(\d+\)\s*/, "").replace(/\s*\|\s*LinkedIn.*$/i, "");
+    const everything = ALL_KEYS.every(k => want.has(k));
+    for (const sec of profileSections(doc)) {
+      const { title } = sectionTitle(sec);
+      if (!title || IGNORED_SECTIONS.test(title)) continue;
+      if (/^about$/i.test(title)) { if (want.has("about")) Object.assign(out, parseAbout(sec)); continue; }
+      const cfg = SECTIONS.find(s => s.rx.test(title));
+      if (!cfg) {
+        // Unknown card with real entries: kept when everything was asked for.
+        const entries = everything ? parseEntries({ parse: parseGeneric }, sec) : [];
+        if (entries.length) out.previews[title] = entries;
+        continue;
+      }
+      if (!want.has(cfg.key)) continue;
+      out.previews[cfg.key] = cfg.text
+        ? extractLines([sec], x => /^h[1-6]$/.test(x.localName)).flatMap(l => l.text.split(/\s*•\s*/)).filter(Boolean)
+        : parseEntries(cfg, sec);
+    }
+    return out;
+  }
+
+  // options: { sections: [keys from ALL_KEYS], skillCategories: bool }
+  //
+  // The profile page and up to PARALLEL "Show all" pages load at the same
+  // time. Show-all URLs are predictable (/details/<slug>/), so those jobs
+  // start straight away; meanwhile the profile page reveals which sections
+  // exist and how many entries each should have. Jobs for sections the
+  // profile doesn't have are dropped, and any list that came back short of
+  // its advertised count is loaded again on its own at the end.
+  async function extractAll(options = {}, onProgress = () => {}) {
     const id = profileId();
     if (!id) throw new Error("Open a LinkedIn profile (linkedin.com/in/…) first.");
     const base = `${location.origin}/in/${encodeURIComponent(id)}/`;
+    const want = new Set((options.sections || []).filter(k => ALL_KEYS.includes(k)));
+    if (!want.size) ALL_KEYS.forEach(k => want.add(k));
+    const categories = options.skillCategories !== false;
+
     const ctx = { cancelled: false, warnings: [] };
     ctx.overlay = createOverlay(() => { ctx.cancelled = true; });
-    let frac = 0;
-    const report = (text, f) => {
-      if (f != null) frac = f;
-      ctx.overlay.step(text, frac);
-      onProgress({ label: text, frac });
-    };
     ctx.cancel = () => { ctx.cancelled = true; };
     currentJob = ctx;
 
+    // Progress rows: one per page the extraction waits on.
+    const rows = new Map();
+    const FINAL = new Set(["done", "skip", "error"]);
+    const setRow = (key, label, value, state) => {
+      rows.set(key, { label, value, state });
+      ctx.overlay.row(key, label, value, state);
+      const all = [...rows.values()];
+      const done = all.filter(r => FINAL.has(r.state)).length;
+      const active = all.find(r => r.state === "active");
+      const label2 = `${done} of ${all.length} done${active ? `  ·  ${active.label}: ${active.value}` : ""}`;
+      const frac = all.length ? done / all.length : 0;
+      ctx.overlay.status(label2, frac);
+      onProgress({ label: label2, frac });
+    };
+
+    const detailCfgs = JOB_ORDER.map(k => SECTION_BY_KEY[k]).filter(c => c && c.slug && want.has(c.key));
+    setRow("profile", "Profile", "waiting", "pending");
+    if (want.has("contact")) setRow("contact", "Contact info", "waiting", "pending");
+    for (const cfg of detailCfgs) setRow(cfg.key, cfg.label, "waiting", "pending");
+
+    const expected = {};       // key → count advertised on the profile page
+    const found = new Map();   // key → "Show all" URL found on the profile page
+    const results = {};        // key → entries from the "Show all" page
+    const jobs = new Map();
+    const pool = makePool(PARALLEL);
+
+    const runDetail = (cfg, url, jctx) => scrapeDetails(
+      jctx, { cfg, url, expected: () => expected[cfg.key] || 0, categories },
+      text => setRow(cfg.key, cfg.label, text, "active"));
+
     try {
-      // 1. Profile page
-      report("Loading profile…", 0.02);
-      const doc = await openPage(ctx, base, d => !!topCard(d));
-      report("Loading every section of the profile…", 0.05);
-      await loadProfileSections(ctx, doc);
-      ensureOn(doc, base);
+      // 1. Show-all pages and contact info, PARALLEL at a time.
+      const startContact = () => {
+        const cctx = { parent: ctx, overlay: ctx.overlay, cancelled: false };
+        let contact = null;
+        const p = pool.run(async () => {
+          checkCancel(cctx);
+          setRow("contact", "Contact info", "loading…", "active");
+          contact = await withPage(cctx, `${base}overlay/contact-info/`,
+            (d, t) => !!parseContact(d) || t > 12000, d => parseContact(d), 20000);
+          setRow("contact", "Contact info", contact ? "✓" : "none", contact ? "done" : "skip");
+        }).catch(e => {
+          if (isCancelled(ctx)) return;
+          ctx.warnings.push(`Contact info: ${e.message}`);
+          setRow("contact", "Contact info", "failed", "error");
+        });
+        return { p, get value() { return contact; } };
+      };
+      const startDetail = cfg => {
+        const url = `${base}details/${cfg.slug}/`;
+        const jctx = { parent: ctx, overlay: ctx.overlay, cancelled: false, error: null };
+        const p = pool.run(async () => {
+          checkCancel(jctx);
+          setRow(cfg.key, cfg.label, "loading…", "active");
+          results[cfg.key] = await runDetail(cfg, url, jctx);
+          const n = results[cfg.key].length;
+          setRow(cfg.key, cfg.label, n ? String(n) : "none", n ? "done" : "skip");
+        }).catch(e => {
+          if (isCancelled(ctx)) return;
+          if (jctx.cancelled) { setRow(cfg.key, cfg.label, "not on profile", "skip"); return; }
+          jctx.error = e;
+          setRow(cfg.key, cfg.label, "retrying…", "pending");
+        });
+        jobs.set(cfg.key, { cfg, url, jctx, p });
+      };
+      // Contact info is quick: queue it right behind the first (longest) list.
+      let contactJob = null;
+      detailCfgs.forEach((cfg, i) => {
+        startDetail(cfg);
+        if (i === 0 && want.has("contact")) contactJob = startContact();
+      });
+      if (!contactJob && want.has("contact")) contactJob = startContact();
+
+      // 2. The profile page, in parallel with the pool.
+      setRow("profile", "Profile", "loading…", "active");
+      const seen = new Set();
+      const discover = doc => {
+        for (const sec of profileSections(doc)) {
+          const { title, count } = sectionTitle(sec);
+          if (!title || seen.has(title)) continue;
+          seen.add(title);
+          if (/^about$/i.test(title)) found.set("about", "");
+          const cfg = SECTIONS.find(s => s.rx.test(title));
+          if (!cfg) continue;
+          found.set(cfg.key, cfg.slug ? detailsUrlFor(sec, cfg) : "");
+          const n = expectedCount(sec, count);
+          if (n) expected[cfg.key] = n;
+        }
+      };
+      // Stop scrolling the profile once every chosen section has shown up.
+      // (If one never does, the scroll runs to the bottom, which is what
+      // proves the section doesn't exist.)
+      const onPage = [...want].filter(k => k === "about" || SECTION_BY_KEY[k]);
+      const page = await withPage(ctx, base, d => !!topCard(d), async doc => {
+        await loadProfileSections(ctx, doc, () => { discover(doc); return onPage.every(k => found.has(k)); });
+        ensureOn(doc, base);
+        discover(doc);
+        return parseProfilePage(doc, want);
+      });
+      ctx.overlay.title(`Extracting ${page.header.name || "profile"}…`);
+      setRow("profile", "Profile", "✓", "done");
+
+      // Drop jobs for sections this profile doesn't have (only if the page
+      // clearly listed its sections; a list that already has entries stays).
+      if ([...found.keys()].some(k => SECTION_BY_KEY[k])) {
+        for (const [key, job] of jobs) if (!found.has(key) && !(results[key] || []).length) job.jctx.cancelled = true;
+      }
+      await Promise.all([...jobs.values()].map(j => j.p).concat(contactJob ? [contactJob.p] : []));
+      checkCancel(ctx);
+
+      // 3. Re-load, one at a time, any list that failed or came back short
+      //    (contention between parallel pages is the usual cause).
+      for (const [key, job] of jobs) {
+        if (job.jctx.cancelled) continue;
+        const have = (results[key] || []).length;
+        const url = found.get(key) || job.url;
+        const short = expected[key] && have < expected[key];
+        // The profile showed entries but the "Show all" page gave none.
+        const emptyButThere = !have && (page.previews[key] || []).length > 0;
+        if (!job.jctx.error && !short && !emptyButThere) continue;
+        setRow(key, job.cfg.label, "re-checking…", "active");
+        try {
+          const again = await runDetail(job.cfg, url, { parent: ctx, overlay: ctx.overlay, cancelled: false });
+          if (again.length > have) results[key] = again;
+        } catch (e) {
+          if (isCancelled(ctx)) throw e;
+          if (!have) ctx.warnings.push(`${job.cfg.label}: ${e.message}`);
+          log(job.cfg.label, e);
+        }
+        const n = (results[key] || []).length;
+        setRow(key, job.cfg.label, n ? String(n) : "none", n ? "done" : key in results ? "skip" : "error");
+      }
+
+      // 4. Assemble, in profile order.
+      const sections = {};
+      for (const cfg of SECTIONS) {
+        if (!want.has(cfg.key)) continue;
+        const full = results[cfg.key] || [];
+        const preview = page.previews[cfg.key] || [];
+        if (full.length) sections[cfg.key] = full;
+        else if (preview.length) {
+          sections[cfg.key] = preview;
+          if (cfg.slug && jobs.has(cfg.key)) ctx.warnings.push(`${cfg.label}: the "Show all" page came back empty; kept the profile preview.`);
+        }
+        if (expected[cfg.key] && full.length && full.length < expected[cfg.key]) {
+          ctx.warnings.push(`${cfg.label}: got ${full.length} of ${expected[cfg.key]} entries (LinkedIn stopped loading more).`);
+        }
+      }
+      for (const [title, entries] of Object.entries(page.previews)) if (!SECTION_BY_KEY[title]) sections[title] = entries;
+      resolveSkillLinks(sections);
 
       const profile = {
         meta: { extractedAt: new Date().toISOString(), profileUrl: base, extractor: `LinkedIn Profile Extractor ${VERSION}` },
-        header: parseHeader(doc),
-        contact: null,
-        about: "",
-        topSkills: [],
-        sections: {},
+        name: page.header.name,
+        header: want.has("header") ? page.header : null,
+        contact: contactJob ? contactJob.value : null,
+        about: page.about,
+        topSkills: page.topSkills,
+        sections,
         warnings: ctx.warnings,
       };
-      if (!profile.header.name) profile.header.name = doc.title.replace(/^\(\d+\)\s*/, "").replace(/\s*\|\s*LinkedIn.*$/i, "");
-
-      const plan = [];
-      for (const sec of profileSections(doc)) {
-        const { title, count } = sectionTitle(sec);
-        if (!title || IGNORED_SECTIONS.test(title)) continue;
-        if (/^about$/i.test(title)) { Object.assign(profile, parseAbout(sec)); continue; }
-        const cfg = SECTIONS.find(s => s.rx.test(title));
-        if (!cfg) {
-          // Unknown card with real entries — keep it under its own heading.
-          const entries = parseEntries({ parse: parseGeneric }, sec);
-          if (entries.length) profile.sections[title] = entries;
-          continue;
-        }
-        if (cfg.text) {
-          profile.sections[cfg.key] = extractLines([sec], x => /^h[1-6]$/.test(x.localName))
-            .flatMap(l => l.text.split(/\s*•\s*/)).filter(Boolean);
-          continue;
-        }
-        profile.sections[cfg.key] = parseEntries(cfg, sec);
-        const url = cfg.slug ? detailsUrlFor(sec, cfg) : "";
-        if (url) plan.push({ cfg, url, expected: expectedCount(sec, count) });
-      }
-
-      // 2. Every section's "Show all" page
-      for (let i = 0; i < plan.length; i++) {
-        const item = plan[i];
-        const f0 = 0.1 + (0.8 * i) / plan.length;
-        report(`${item.cfg.label} (${i + 1}/${plan.length})…`, f0);
-        try {
-          const entries = await scrapeDetails(ctx, item, t => report(`${t}  ·  section ${i + 1}/${plan.length}`));
-          // The details page is the full list; the profile preview is only a
-          // fallback for when it comes back empty.
-          if (entries.length) profile.sections[item.cfg.key] = entries;
-          else if ((profile.sections[item.cfg.key] || []).length) ctx.warnings.push(`${item.cfg.label}: the "Show all" page came back empty; kept the profile preview.`);
-          if (item.expected && entries.length < item.expected) {
-            ctx.warnings.push(`${item.cfg.label}: got ${entries.length} of ${item.expected} entries (LinkedIn stopped loading more).`);
-          }
-        } catch (e) {
-          if (ctx.cancelled) throw e;
-          ctx.warnings.push(`${item.cfg.label}: ${e.message}`);
-          log(item.cfg.label, e);
-        }
-      }
-
-      // 3. Contact info
-      report("Contact info…", 0.92);
-      try {
-        const d = await openPage(ctx, `${base}overlay/contact-info/`, (d, t) => !!parseContact(d) || t > 12000, 20000);
-        profile.contact = parseContact(d);
-      } catch (e) {
-        if (ctx.cancelled) throw e;
-        ctx.warnings.push(`Contact info: ${e.message}`);
-      }
-
-      resolveSkillLinks(profile.sections);
-      report("Done", 1);
+      ctx.overlay.status("Done", 1);
+      onProgress({ label: "Done", frac: 1 });
       return prune(profile);
     } finally {
+      ctx.cancelled = true; // stops any page load still queued if we bailed out early
       ctx.overlay.remove();
       currentJob = null;
     }
@@ -1293,12 +1487,14 @@
     };
 
     L.push(DIV, "  LINKEDIN PROFILE EXTRACT",
-      `  Name      : ${p.header?.name || ""}`,
+      `  Name      : ${p.name || ""}`,
       `  Profile   : ${p.meta.profileUrl}`,
       `  Extracted : ${new Date(p.meta.extractedAt).toLocaleString()}`, DIV);
 
-    H("Personal Information");
-    for (const [k, v] of Object.entries(p.header || {})) field(k, v, "  ");
+    if (p.header) {
+      H("Personal Information");
+      for (const [k, v] of Object.entries(p.header)) field(k, v, "  ");
+    }
     if (p.contact) { H("Contact Info"); for (const [k, v] of Object.entries(p.contact)) field(k, v, "  "); }
     if (p.about || p.topSkills) {
       H("About");
@@ -1367,23 +1563,23 @@
 
   const notify = msg => { if (hasExt) chrome.runtime.sendMessage(msg).catch(() => {}); };
 
-  async function runJob() {
+  // Runs an extraction and stores the text for the popup. Nothing is
+  // downloaded until the user clicks Download there.
+  async function runJob(options) {
     lastProgress = { label: "Starting…", frac: 0 };
     try {
-      const profile = await extractAll(p => { lastProgress = p; notify({ type: "li-progress", ...p }); });
+      const profile = await extractAll(options, p => { lastProgress = p; notify({ type: "li-progress", ...p }); });
       const record = {
-        name: profile.header?.name || "",
+        name: profile.name || "",
         url: profile.meta.profileUrl,
         extractedAt: profile.meta.extractedAt,
-        fileBase: fileBase(profile.header?.name),
+        fileBase: fileBase(profile.name),
         counts: counts(profile),
         warnings: profile.warnings || [],
         txt: formatText(profile),
-        json: JSON.stringify(profile, null, 2),
       };
       await chrome.storage.local.set({ lastExtract: record });
       notify({ type: "li-done", name: record.name, counts: record.counts });
-      notify({ action: "download", format: "txt" });
       log("Done", record.counts);
     } catch (e) {
       log("Failed:", e);
@@ -1401,7 +1597,7 @@
     if (request.action === "extractAll") {
       if (!profileId()) { sendResponse({ success: false, error: "Open a LinkedIn profile (linkedin.com/in/…) first." }); return; }
       if (currentJob) { sendResponse({ success: true, data: { started: false, running: true } }); return; }
-      runJob();
+      runJob(request.options || {});
       sendResponse({ success: true, data: { started: true } });
       return;
     }
@@ -1412,7 +1608,7 @@
   };
 
   // Console hook for debugging from the content-script context.
-  window.__liExtractor = { extractAll, formatText, parseHeader, parseEntries, SECTIONS, VERSION };
+  window.__liExtractor = { extractAll, formatText, parseHeader, parseEntries, SECTIONS, ALL_KEYS, VERSION };
 
   if (hasExt) chrome.runtime.onMessage.addListener(window.__liExtractHandler);
   log(`v${VERSION} ready —`, location.pathname);

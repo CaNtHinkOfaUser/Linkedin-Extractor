@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "LinkedIn Profile Extractor",
-  "version": "2.0.0",
-  "description": "Extract a full LinkedIn profile (every section, every skill) into a text or JSON file.",
+  "version": "2.1.0",
+  "description": "Extract a LinkedIn profile into a clean text file: every section and every skill, or just the sections you pick.",
   "permissions": [
     "activeTab",
     "scripting",
