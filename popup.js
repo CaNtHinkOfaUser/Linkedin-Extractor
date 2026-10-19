@@ -1,57 +1,83 @@
-// LinkedIn Extractor — Popup Script v2.0
-// Fix: removed duplicate executeScript injection.
-// The manifest already declares content.js via content_scripts, so
-// calling executeScript again from the popup races and invalidates
-// the extension context, producing "chrome-extension://invalid/" errors.
-// Instead we just sendMessage directly, with a single safe retry if
-// the listener isn't ready yet (tab was open before extension loaded).
+// LinkedIn Extractor — Popup Script v3.0
+// The extraction itself runs in content.js on the LinkedIn tab, so it keeps
+// going if this popup closes. The popup starts it, mirrors its progress
+// messages, and offers the last result (kept in chrome.storage.local) for
+// download through background.js.
 
 // ─────────────────────────────────────────────
 // ELEMENT REFS
 // ─────────────────────────────────────────────
-const $modeBadge    = document.getElementById("modeBadge");
-const $modeIcon     = document.getElementById("modeIcon");
-const $modeLabel    = document.getElementById("modeLabel");
-const $modeSub      = document.getElementById("modeSub");
-const $chipsWrap    = document.getElementById("chipsWrap");
-const $chipsGrid    = document.getElementById("chipsGrid");
-const $tip          = document.getElementById("tip");
-const $extractBtn   = document.getElementById("extractBtn");
-const $btnIcon      = document.getElementById("btnIcon");
-const $btnText      = document.getElementById("btnText");
-const $spinner      = document.getElementById("spinner");
-const $resultsPanel = document.getElementById("resultsPanel");
-const $resultsPre   = document.getElementById("resultsPre");
-const $copyAllBtn   = document.getElementById("copyAllBtn");
-const $clearBtn     = document.getElementById("clearBtn");
-const $footerTip    = document.getElementById("footerTip");
-const $debugBtn     = document.getElementById("debugBtn");
+const $modeBadge     = document.getElementById("modeBadge");
+const $modeIcon      = document.getElementById("modeIcon");
+const $modeLabel     = document.getElementById("modeLabel");
+const $modeSub       = document.getElementById("modeSub");
+const $progress      = document.getElementById("progress");
+const $progressFill  = document.getElementById("progressFill");
+const $progressLabel = document.getElementById("progressLabel");
+const $chipsWrap     = document.getElementById("chipsWrap");
+const $chipsLabel    = document.getElementById("chipsLabel");
+const $chipsGrid     = document.getElementById("chipsGrid");
+const $warn          = document.getElementById("warn");
+const $tip           = document.getElementById("tip");
+const $extractBtn    = document.getElementById("extractBtn");
+const $btnIcon       = document.getElementById("btnIcon");
+const $btnText       = document.getElementById("btnText");
+const $spinner       = document.getElementById("spinner");
+const $dlRow         = document.getElementById("dlRow");
+const $dlTxtBtn      = document.getElementById("dlTxtBtn");
+const $dlJsonBtn     = document.getElementById("dlJsonBtn");
+const $previewBtn    = document.getElementById("previewBtn");
+const $resultsPanel  = document.getElementById("resultsPanel");
+const $resultsPre    = document.getElementById("resultsPre");
+const $copyAllBtn    = document.getElementById("copyAllBtn");
+const $clearBtn      = document.getElementById("clearBtn");
+const $footerTip     = document.getElementById("footerTip");
 
-let lastFormatted  = "";
-let currentMode    = "unknown";
-let extractionDone = false;
+const PROFILE_URL_RX = /^https:\/\/www\.linkedin\.com\/in\/[^/?#]+/;
 
-// ─────────────────────────────────────────────
-// SECTION KEYS
-// ─────────────────────────────────────────────
-const SECTION_KEYS = [
-  "experience", "education", "skills", "certifications",
-  "projects", "volunteering", "languages", "honors",
-  "publications", "courses", "recommendations",
-];
+const SECTION_LABELS = {
+  experience: "experience", education: "education", certifications: "certifications",
+  projects: "projects", volunteering: "volunteering", skills: "skills", honors: "honors",
+  courses: "courses", testScores: "test scores", languages: "languages",
+  publications: "publications", patents: "patents", organizations: "organizations",
+  recommendations: "recommendations", featured: "featured", interests: "interests", causes: "causes",
+};
+
+let activeTab = null;
+let last = null;      // lastExtract record from storage
+let running = false;
 
 // ─────────────────────────────────────────────
 // UI HELPERS
 // ─────────────────────────────────────────────
-function setLoading(yes) {
+function setBadge(kind, icon, label, sub) {
+  $modeBadge.className   = `mode-badge mode-${kind}`;
+  $modeIcon.textContent  = icon;
+  $modeLabel.textContent = label;
+  $modeSub.textContent   = sub;
+}
+
+function setFooter(prefix, strong, suffix = "") {
+  $footerTip.replaceChildren(document.createTextNode(prefix));
+  const s = document.createElement("span");
+  s.textContent = strong;
+  $footerTip.append(s, document.createTextNode(suffix));
+}
+
+function setRunning(yes) {
+  running = yes;
   $spinner.classList.toggle("visible", yes);
   $btnIcon.style.display = yes ? "none" : "inline";
-  $extractBtn.disabled   = yes;
-  if (yes) {
-    $btnText.textContent = "EXTRACTING…";
-  } else if (!extractionDone) {
-    $btnText.textContent = currentMode === "detail" ? "EXTRACT THIS SECTION" : "EXTRACT";
-  }
+  $extractBtn.disabled   = yes || !activeTab || !PROFILE_URL_RX.test(activeTab.url || "");
+  $btnText.textContent   = yes ? "EXTRACTING…" : last ? "EXTRACT AGAIN" : "EXTRACT FULL PROFILE";
+  $progress.classList.toggle("visible", yes);
+  if (yes) $tip.classList.add("visible");
+}
+
+function showProgress({ label, frac }) {
+  if (!running) setRunning(true);
+  if (frac != null) $progressFill.style.width = `${Math.round(frac * 100)}%`;
+  if (label) $progressLabel.textContent = label;
 }
 
 function flashSuccess() {
@@ -59,39 +85,42 @@ function flashSuccess() {
   setTimeout(() => $modeBadge.classList.remove("flash"), 1000);
 }
 
-function renderChips(profile) {
-  $chipsGrid.innerHTML = "";
-  for (const key of SECTION_KEYS) {
-    const data  = profile[key];
-    const count = Array.isArray(data) ? data.length : (data ? 1 : 0);
-    const chip  = document.createElement("div");
+function renderLast() {
+  if (!last) {
+    $chipsWrap.classList.remove("visible");
+    $dlRow.classList.remove("visible");
+    $warn.classList.remove("visible");
+    return;
+  }
+  $chipsGrid.replaceChildren();
+  for (const [key, count] of Object.entries(last.counts || {})) {
+    const chip = document.createElement("div");
     chip.className   = `chip${count === 0 ? " empty" : ""}`;
-    chip.textContent = count > 0 ? `${key} (${count})` : key;
+    chip.textContent = `${SECTION_LABELS[key] || key} (${count})`;
     $chipsGrid.appendChild(chip);
   }
+  const when = new Date(last.extractedAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  $chipsLabel.textContent = `Last extract · ${last.name || "profile"} · ${when}`;
   $chipsWrap.classList.add("visible");
+  $dlRow.classList.add("visible");
+
+  const warnings = last.warnings || [];
+  $warn.textContent = warnings.length ? `⚠ ${warnings.join("  ·  ")}` : "";
+  $warn.classList.toggle("visible", warnings.length > 0);
 }
 
-function showResults(text) {
-  $resultsPre.textContent = text;
-  $resultsPanel.classList.add("visible");
-  $resultsPre.scrollTop = 0;
-}
-
-function hideResults() {
-  $resultsPanel.classList.remove("visible");
-  $resultsPre.textContent = "";
-  $chipsWrap.classList.remove("visible");
-  lastFormatted  = "";
-  extractionDone = false;
+async function loadLast() {
+  const { lastExtract } = await chrome.storage.local.get("lastExtract");
+  last = lastExtract || null;
+  renderLast();
 }
 
 // ─────────────────────────────────────────────
 // MESSAGING
 // ─────────────────────────────────────────────
-// Sends a message to the content script.
-// If no listener is registered yet (tab was open before the extension
-// was installed/reloaded), we inject the script once and retry.
+// Sends a message to the content script. If no listener is registered yet
+// (the tab was open before the extension loaded, or LinkedIn navigated to the
+// profile client-side), inject the script once and retry.
 async function sendToContent(tabId, action) {
   const send = () => new Promise((resolve, reject) => {
     chrome.tabs.sendMessage(tabId, { action }, res => {
@@ -101,13 +130,11 @@ async function sendToContent(tabId, action) {
   });
 
   try {
-    // First attempt — will work if content script is already running
     return await send();
   } catch (_) {
-    // Content script not running (pre-existing tab). Inject once then retry.
     try {
       await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
-      await new Promise(r => setTimeout(r, 150)); // let the script register its listener
+      await new Promise(r => setTimeout(r, 150));
       return await send();
     } catch (err) {
       throw new Error("Could not reach the page. Try reloading the LinkedIn tab.");
@@ -115,172 +142,113 @@ async function sendToContent(tabId, action) {
   }
 }
 
-// ─────────────────────────────────────────────
-// MODE DETECTION → UI UPDATE
-// ─────────────────────────────────────────────
-async function detectAndUpdateUI() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const url   = tab?.url || "";
-
-  if (!url.includes("linkedin.com/in/")) {
-    $modeBadge.className   = "mode-badge mode-unknown";
-    $modeIcon.textContent  = "🔗";
-    $modeLabel.textContent = "Not a LinkedIn Profile";
-    $modeSub.textContent   = "Navigate to linkedin.com/in/someone";
-    $extractBtn.disabled   = true;
-    $tip.classList.remove("visible");
-    $footerTip.innerHTML   = `Go to a <span>linkedin.com/in/</span> page`;
-    if ($debugBtn) $debugBtn.style.display = "none";
-    currentMode = "unknown";
-    return;
-  }
-
-  if ($debugBtn) $debugBtn.style.display = "inline-flex";
-
-  let modeData = { mode: "unknown" };
-  try {
-    if (tab?.id != null) {
-      const res = await sendToContent(tab.id, "detectMode");
-      if (res?.success) modeData = res.data;
-    }
-  } catch (_) {}
-
-  currentMode = modeData.mode;
-
-  if (modeData.mode === "main") {
-    $modeBadge.className   = "mode-badge mode-main";
-    $modeIcon.textContent  = "👤";
-    $modeLabel.textContent = "Full Profile Page";
-    $modeSub.textContent   = "Will extract all sections visible on the page";
-    $extractBtn.disabled   = false;
-    $extractBtn.className  = "extract-btn";
-    $btnText.textContent   = "EXTRACT";
-    $tip.classList.add("visible");
-    $footerTip.innerHTML   = `Tip: scroll the page + click <span>Show all</span> first`;
-
-  } else if (modeData.mode === "detail") {
-    const rawSection  = modeData.section || "section";
-    const sectionName = rawSection.charAt(0).toUpperCase() + rawSection.slice(1);
-    $modeBadge.className   = "mode-badge mode-detail";
-    $modeIcon.textContent  = "📋";
-    $modeLabel.textContent = `Detail Page — ${sectionName}`;
-    $modeSub.textContent   = "Will extract every entry on this page";
-    $extractBtn.disabled   = false;
-    $extractBtn.className  = "extract-btn detail-mode";
-    $btnText.textContent   = "EXTRACT THIS SECTION";
-    $tip.classList.add("visible");
-    $footerTip.innerHTML   = `Tip: scroll to bottom so all <span>${sectionName}</span> entries load`;
-
-  } else {
-    $modeBadge.className   = "mode-badge mode-unknown";
-    $modeIcon.textContent  = "❓";
-    $modeLabel.textContent = "Unknown LinkedIn Page";
-    $modeSub.textContent   = "Go to a profile or a /details/ sub-page";
-    $extractBtn.disabled   = true;
-    $tip.classList.remove("visible");
-  }
-}
-
-// ─────────────────────────────────────────────
-// EXTRACT FLOW
-// ─────────────────────────────────────────────
-async function doExtract() {
-  extractionDone = false;
-  setLoading(true);
-  $modeLabel.textContent = "Extracting…";
-  $modeSub.textContent   = "Reading the page, please wait";
-  hideResults();
-
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) throw new Error("Could not access the active tab.");
-
-    const res = await sendToContent(tab.id, "extract");
-    if (!res?.success) throw new Error(res?.error || "Unknown error from content script");
-
-    const result  = res.data;
-    lastFormatted = result.formatted || "";
-    showResults(lastFormatted);
-
-    if (result.mode === "main") {
-      const name = result.profile?.header?.name || "Profile";
-      $modeLabel.textContent = `✓ Extracted: ${name}`;
-      $modeSub.textContent   = "Ready to copy";
-      renderChips(result.profile);
-      const filled = SECTION_KEYS.filter(k => {
-        const d = result.profile[k];
-        return Array.isArray(d) ? d.length > 0 : !!d;
-      }).length;
-      $footerTip.innerHTML = `<span>${filled}</span> sections found`;
-
-    } else if (result.mode === "detail") {
-      const rawSection  = result.section || "section";
-      const sectionName = rawSection.charAt(0).toUpperCase() + rawSection.slice(1);
-      $modeLabel.textContent = `✓ ${sectionName}: ${result.count} entries`;
-      $modeSub.textContent   = "Ready to copy";
-      $footerTip.innerHTML   = `<span>${result.count}</span> entries extracted`;
-    }
-
-    flashSuccess();
-    extractionDone       = true;
-    $btnIcon.textContent = "↺";
-    $btnText.textContent = "EXTRACT AGAIN";
-
-  } catch (err) {
-    console.error("[LinkedIn Extractor]", err);
-    $modeBadge.className   = "mode-badge mode-unknown";
-    $modeLabel.textContent = "Extraction Failed";
-    $modeSub.textContent   = err.message || "Reload the page and try again";
-    extractionDone         = true;
-    $btnIcon.textContent   = "⬇";
-    $btnText.textContent   = "RETRY";
-  } finally {
-    setLoading(false);
-  }
-}
-
-// ─────────────────────────────────────────────
-// EVENTS
-// ─────────────────────────────────────────────
-$extractBtn.addEventListener("click", doExtract);
-
-$copyAllBtn.addEventListener("click", async () => {
-  if (!lastFormatted) return;
-  try {
-    await navigator.clipboard.writeText(lastFormatted);
-    $copyAllBtn.textContent = "✓ Copied!";
-    $copyAllBtn.classList.add("copied");
-    setTimeout(() => {
-      $copyAllBtn.textContent = "📋 Copy All";
-      $copyAllBtn.classList.remove("copied");
-    }, 2000);
-  } catch (e) {
-    $copyAllBtn.textContent = "⚠ Failed";
-    setTimeout(() => { $copyAllBtn.textContent = "📋 Copy All"; }, 2000);
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (!msg?.type || !sender.tab || sender.tab.id !== activeTab?.id) return;
+  if (msg.type === "li-progress") {
+    showProgress(msg);
+  } else if (msg.type === "li-done") {
+    setRunning(false);
+    loadLast().then(() => {
+      setRunning(false);
+      setBadge("detail", "✓", `Extracted: ${msg.name || "profile"}`, "The .txt is downloading — JSON below");
+      const total = Object.values(msg.counts || {}).reduce((a, b) => a + b, 0);
+      setFooter("", String(total), " entries across all sections");
+      flashSuccess();
+    });
+  } else if (msg.type === "li-error") {
+    setRunning(false);
+    setBadge("unknown", "⚠", msg.error === "Cancelled" ? "Extraction cancelled" : "Extraction failed", msg.error || "Reload the page and try again");
   }
 });
 
-$clearBtn.addEventListener("click", () => {
-  hideResults();
-  detectAndUpdateUI();
-});
-
-if ($debugBtn) {
-  $debugBtn.addEventListener("click", async () => {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) return;
-    try {
-      await sendToContent(tab.id, "debug");
-      $debugBtn.textContent = "✓ Check console";
-      setTimeout(() => { $debugBtn.textContent = "🔍 Debug"; }, 2500);
-    } catch (e) {
-      $debugBtn.textContent = "⚠ Error";
-      setTimeout(() => { $debugBtn.textContent = "🔍 Debug"; }, 2000);
-    }
-  });
+async function download(format) {
+  const res = await chrome.runtime.sendMessage({ action: "download", format });
+  if (!res?.success) throw new Error(res?.error || "Download failed");
 }
 
 // ─────────────────────────────────────────────
 // INIT
 // ─────────────────────────────────────────────
-detectAndUpdateUI();
+async function init() {
+  [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  await loadLast();
+  const url = activeTab?.url || "";
+
+  if (!PROFILE_URL_RX.test(url)) {
+    setBadge("unknown", "🔗", "Not a LinkedIn Profile", "Navigate to linkedin.com/in/someone");
+    setFooter("Go to a ", "linkedin.com/in/", " page");
+    setRunning(false);
+    return;
+  }
+
+  const name = (activeTab.title || "").replace(/^\(\d+\)\s*/, "").replace(/\s*\|\s*LinkedIn.*$/i, "").trim();
+  setBadge("main", "👤", name || "LinkedIn Profile", "Extracts every section, including all skills");
+  setFooter("Saves as ", ".txt", " + .json");
+  $tip.classList.add("visible");
+  setRunning(false);
+
+  try {
+    const res = await sendToContent(activeTab.id, "status");
+    if (res?.data?.running) showProgress(res.data.progress || { label: "Extracting…" });
+  } catch (_) {}
+}
+
+// ─────────────────────────────────────────────
+// EVENTS
+// ─────────────────────────────────────────────
+$extractBtn.addEventListener("click", async () => {
+  if (!activeTab?.id) return;
+  $resultsPanel.classList.remove("visible");
+  showProgress({ label: "Starting…", frac: 0 });
+  setBadge("main", "⏳", "Extracting…", "Watch the overlay on the LinkedIn tab");
+  try {
+    const res = await sendToContent(activeTab.id, "extractAll");
+    if (!res?.success) throw new Error(res?.error || "Could not start");
+  } catch (err) {
+    setRunning(false);
+    setBadge("unknown", "⚠", "Extraction failed", err.message);
+  }
+});
+
+for (const [btn, format] of [[$dlTxtBtn, "txt"], [$dlJsonBtn, "json"]]) {
+  btn.addEventListener("click", async () => {
+    const label = btn.textContent;
+    try {
+      await download(format);
+      btn.textContent = "✓ Saved";
+    } catch (e) {
+      btn.textContent = "⚠ Failed";
+      console.error("[LinkedIn Extractor]", e);
+    }
+    setTimeout(() => { btn.textContent = label; }, 1800);
+  });
+}
+
+$previewBtn.addEventListener("click", () => {
+  if (!last?.txt) return;
+  $resultsPre.textContent = last.txt;
+  $resultsPanel.classList.add("visible");
+  $resultsPre.scrollTop = 0;
+});
+
+$copyAllBtn.addEventListener("click", async () => {
+  if (!last?.txt) return;
+  try {
+    await navigator.clipboard.writeText(last.txt);
+    $copyAllBtn.textContent = "✓ Copied!";
+    $copyAllBtn.classList.add("copied");
+  } catch (e) {
+    $copyAllBtn.textContent = "⚠ Failed";
+  }
+  setTimeout(() => {
+    $copyAllBtn.textContent = "📋 Copy All";
+    $copyAllBtn.classList.remove("copied");
+  }, 2000);
+});
+
+$clearBtn.addEventListener("click", () => {
+  $resultsPanel.classList.remove("visible");
+  $resultsPre.textContent = "";
+});
+
+init();

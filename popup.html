@@ -55,8 +55,21 @@
       .spinner.visible { display:block; }
       @keyframes spin { to { transform:rotate(360deg); } }
 
-      .debug-btn { display:none; align-items:center; justify-content:center; gap:4px; width:100%; padding:6px; border:1px dashed var(--border); border-radius:6px; background:transparent; color:var(--muted); font-family:var(--mono); font-size:9px; cursor:pointer; transition:all .2s; margin-bottom:0; }
-      .debug-btn:hover { border-color:var(--muted); color:var(--text); }
+      .progress { display:none; margin:10px 16px 0; }
+      .progress.visible { display:block; }
+      .progress-track { height:4px; background:var(--border); border-radius:2px; overflow:hidden; }
+      .progress-fill { height:100%; width:0; background:var(--accent); transition:width .3s; }
+      .progress-label { font-size:10px; color:var(--muted); margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+      .dl-row { display:none; gap:6px; }
+      .dl-row.visible { display:flex; }
+      .dl-btn { flex:1; padding:9px; border:1px solid rgba(48,209,88,.4); border-radius:8px; background:rgba(48,209,88,.08); color:var(--accent2); font-family:var(--mono); font-size:11px; font-weight:700; cursor:pointer; transition:all .15s; }
+      .dl-btn:hover { background:rgba(48,209,88,.18); border-color:var(--accent2); }
+      .dl-btn.secondary { border-color:var(--border); background:transparent; color:var(--muted); }
+      .dl-btn.secondary:hover { background:var(--border); color:var(--text); }
+
+      .warn { display:none; margin:10px 16px 0; font-size:10px; line-height:1.5; color:var(--gold); }
+      .warn.visible { display:block; }
 
       .results-panel { display:none; flex-direction:column; margin:0 16px 14px; border:1px solid var(--border); border-radius:10px; overflow:hidden; background:var(--surface); }
       .results-panel.visible { display:flex; }
@@ -86,9 +99,9 @@
       <div class="header-row">
         <div class="logo">Li</div>
         <div class="app-name">PROFILE EXTRACTOR</div>
-        <div class="ver">v1.4</div>
+        <div class="ver">v2.0</div>
       </div>
-      <div class="tagline">Export LinkedIn profiles to clean text</div>
+      <div class="tagline">Export full LinkedIn profiles to text or JSON</div>
     </div>
 
     <div class="mode-badge mode-unknown" id="modeBadge">
@@ -99,23 +112,34 @@
       </div>
     </div>
 
+    <div class="progress" id="progress">
+      <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="progress-label" id="progressLabel"></div>
+    </div>
+
     <div class="chips-wrap" id="chipsWrap">
-      <div class="chips-label">Sections found</div>
+      <div class="chips-label" id="chipsLabel">Sections extracted</div>
       <div class="chips" id="chipsGrid"></div>
     </div>
 
+    <div class="warn" id="warn"></div>
+
     <div class="tip" id="tip">
-      💡 Scroll the full profile before extracting so LinkedIn loads all sections.
-      On detail pages, scroll to the bottom to load all entries.
+      💡 Opens every "Show all" page (all skills, certifications, awards…) in an overlay on this tab.
+      Keep the tab in front until it finishes, usually about a minute. The .txt downloads automatically.
     </div>
 
     <div class="body">
       <button class="extract-btn" id="extractBtn" disabled>
         <div class="spinner" id="spinner"></div>
         <span id="btnIcon">⬇</span>
-        <span id="btnText">EXTRACT</span>
+        <span id="btnText">EXTRACT FULL PROFILE</span>
       </button>
-      <button class="debug-btn" id="debugBtn">🔍 Debug (check DevTools console on LinkedIn tab)</button>
+      <div class="dl-row" id="dlRow">
+        <button class="dl-btn" id="dlTxtBtn">⬇ .TXT</button>
+        <button class="dl-btn" id="dlJsonBtn">⬇ .JSON</button>
+        <button class="dl-btn secondary" id="previewBtn">Preview</button>
+      </div>
     </div>
 
     <div class="results-panel" id="resultsPanel">
@@ -125,7 +149,7 @@
           <span>EXTRACTED OUTPUT</span>
         </div>
         <div class="results-toolbar-right">
-          <button class="tool-btn" id="clearBtn">✕ Clear</button>
+          <button class="tool-btn" id="clearBtn">✕ Close</button>
           <button class="tool-btn copy-all" id="copyAllBtn">📋 Copy All</button>
         </div>
       </div>

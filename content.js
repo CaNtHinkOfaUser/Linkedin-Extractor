@@ -1,1122 +1,1419 @@
-// LinkedIn Profile Extractor — Content Script v8.3
-// ── Accessibility-tree-first rewrite ────────────────────────────────
+// LinkedIn Profile Extractor — Content Script v2.0
 //
-//  WHY v8.1 (root causes of v7.0 returning nothing):
-//    1. getTexts() read raw innerText of each item. LinkedIn emits every
-//       field TWICE — a visible <span aria-hidden="true">VALUE</span> and
-//       a sibling screen-reader-only span. innerText merges them, so the
-//       positional field guesses (rest[0]=title, rest[1]=company…)
-//       silently broke and empty results got filtered out.
-//    2. No scroll between retries → lazy-loaded entries never appeared.
-//    3. No tab handling → Recommendations/Interests incomplete.
+// A full extract can't just read the page the user is looking at: the
+// profile only previews each section ("Show all 97 skills →"), and the full
+// lists live on /in/<id>/details/<section>/ pages that lazy-load ten entries
+// at a time as the end of the list scrolls into a *visible* viewport. So
+// extractAll() opens an overlay on the current tab holding a same-origin
+// <iframe>, and in it:
+//   1. loads the profile, scrolls until every section card has rendered and
+//      reads the header, About and each section's preview,
+//   2. loads every section's details page, scrolls / clicks "Load more" until
+//      the list stops growing, then re-reads the full list (skills are also
+//      re-read per category tab to tag each skill with its category),
+//   3. loads the contact-info overlay.
+// The result is stored in chrome.storage.local and background.js downloads it.
 //
-//  FIXES:
-//    • itemFields() reads <span aria-hidden="true"> leaves of the entry's
-//      profile-component-entity container, in DOM order — no SR dupes.
-//    • Two-anchor invariant: a[0]=entity (company/school/issuer),
-//      a[1]=detail container. Robust company vs. role separation.
-//    • Dates split on literal "·" then " - " (not regex char classes).
-//    • getItems(): role=list>listitem → bare listitem → li → pvs fallback.
-//    • findSection(): h2/h3 text → data-view-name=profile-card → aria-label.
-//    • Scroll between retries + tabpanel iteration for tabbed sections.
-// ────────────────────────────────────────────────────────────────────
+// Markup notes (LinkedIn's 2025+ React profile): class names are hashed per
+// deploy, so nothing here keys on classes. Stable hooks:
+//   [componentkey^="entity-collection-item"]  one per entry
+//   [data-testid="expandable-text-box"]       descriptions (full text in DOM)
+//   [data-testid^="profile_"]                 the list on a details page
+//   [data-testid="lazy-column"]               tabbed lists (interests, recs)
+// Text is read per rendered block (extractLines), skipping visually hidden
+// screen-reader copies and button labels. The page enforces Trusted Types,
+// so the overlay is built with DOM calls, never innerHTML.
 
 (function () {
   "use strict";
 
-  if (window.__liExtractHandler) {
+  const VERSION = "2.0.0";
+  const hasExt = typeof chrome !== "undefined" && !!(chrome.runtime && chrome.runtime.id);
+
+  if (hasExt && window.__liExtractHandler) {
     try { chrome.runtime.onMessage.removeListener(window.__liExtractHandler); } catch (_) {}
   }
 
-  const SECTION_MAP = {
-    "certifications":              "certifications",
-    "licenses-and-certifications": "certifications",
-    "experience":                  "experience",
-    "education":                   "education",
-    "skills":                      "skills",
-    "projects":                    "projects",
-    "volunteering-experiences":    "volunteering",
-    "volunteer-experiences":       "volunteering",
-    "languages":                   "languages",
-    "honors":                      "honors",
-    "honors-and-awards":           "honors",
-    "awards":                      "honors",
-    "publications":                "publications",
-    "courses":                     "courses",
-    "recommendations":             "recommendations",
-    "organizations":               "organizations",
-    "patents":                     "patents",
-    "interests":                   "interests",
-  };
-
-  const q   = (root, sel) => (root || document).querySelector(sel);
-  const qa  = (root, sel) => Array.from((root || document).querySelectorAll(sel));
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const qa = (root, sel) => Array.from(root.querySelectorAll(sel));
+  const log = (...a) => console.log("[Li Extractor]", ...a);
 
-  function clean(t) {
+  // An entry is one element, or (for hr-separated lists) an array of siblings.
+  const roots = e => (Array.isArray(e) ? e : [e]);
+  const within = (e, n) => roots(e).some(r => r === n || r.contains(n));
+  const qe = (e, sel) => roots(e).flatMap(r => (r.matches(sel) ? [r] : []).concat(qa(r, sel)));
+
+  // ─────────────────────────────────────────────────────────────
+  // TEXT
+  // ─────────────────────────────────────────────────────────────
+  function tidy(t) {
     return String(t || "")
-      .replace(/[\u200b\u200c\u200d\ufeff\u00ad]/g, "")
-      .replace(/\s+/g, " ")
+      .replace(/[​-‍⁠﻿­]/g, "")
+      .replace(/[^\S\n]+/g, " ")
+      .replace(/ ?\n ?/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/^([A-Z][\w &]{1,30}):(?=\S)/, "$1: ")
       .trim();
   }
+  const oneLine = t => tidy(t).replace(/\s*\n\s*/g, " ");
 
   const JUNK = new Set([
-    "·","•","|","–","-","…","...","Show credential","Show all",
-    "See credential","See more","View","Edit","Follow","Connect","Message",
-    "More","Save","Share","…see more","… See more",
+    "·", "•", "|", "-", "–", "—", "…", "...", "more", "… more", "…more",
+    "see more", "show more", "see less", "show less", "show all",
+    "show credential", "see credential", "show project", "show publication",
+    "show patent", "edit", "endorse", "endorsed", "follow", "following",
+    "connect", "message", "pending", "add section", "add profile section",
+    "open to", "enhance profile", "resources",
   ]);
+  const isJunk = t => JUNK.has(t.toLowerCase()) || /^·?\s*(1st|2nd|3rd\+?)$/i.test(t);
 
-  // ─────────────────────────────────────────────────────────────
-  // ACCESSIBLE NAME
-  // ─────────────────────────────────────────────────────────────
-  function accessibleName(el) {
-    if (!el) return "";
-    const direct = el.getAttribute("aria-label");
-    if (direct) return clean(direct).toLowerCase();
-    const labelId = el.getAttribute("aria-labelledby");
-    if (labelId) {
-      const text = labelId.split(/\s+/)
-        .map(id => document.getElementById(id))
-        .filter(Boolean)
-        .map(e => clean(e.innerText || e.textContent))
-        .join(" ");
-      if (text) return text.toLowerCase();
+  const SKIP_TAGS = new Set([
+    "script", "style", "noscript", "template", "svg", "img", "picture", "video",
+    "audio", "canvas", "iframe", "button", "input", "select", "textarea",
+    "option", "dialog", "hr",
+  ]);
+  const INLINE = new Set(["inline", "inline-block", "inline-flex", "inline-grid", "inline-table", "contents", "ruby"]);
+  const PRE_RX = /^(pre|pre-wrap|pre-line|break-spaces)$/;
+
+  function isHidden(el, s) {
+    if (el.hidden || s.display === "none" || s.visibility === "hidden" || s.visibility === "collapse") return true;
+    // Screen-reader-only copies: absolutely positioned and clipped to 0–1px.
+    if (s.position === "absolute" || s.position === "fixed") {
+      if (/rect\(\s*0(px)?[\s,]+0(px)?[\s,]+0(px)?[\s,]+0(px)?\s*\)/.test(s.clip)) return true;
+      if (parseFloat(s.width) <= 1 && parseFloat(s.height) <= 1) return true;
     }
-    return "";
+    if (/inset\(\s*50%/.test(s.clipPath || "")) return true;
+    return /\b(visually-hidden|sr-only|a11y-text|screen-reader-text)\b/.test(String(el.className || ""));
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // VISIBILITY HELPERS
-  // ─────────────────────────────────────────────────────────────
-  function isVisuallyHidden(el) {
-    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
-    const s = getComputedStyle(el);
-    if (s.display === "none" || s.visibility === "hidden" || Number(s.opacity) === 0) return true;
-    // LinkedIn's screen-reader-only containers (clip/absolute 1px trick)
-    if (s.position === "absolute" && (s.width === "1px" || s.height === "1px")) return true;
-    const cls = (el.className || "").toString();
-    return /visually-hidden|sr-only|a11y-text|screen-reader-text|__visually-hidden/.test(cls);
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // CORE FIELD READER  (the heart of v8.1)
-  //
-  // LinkedIn lays each entry out as nested wrappers ending in
-  // <span aria-hidden="true">VALUE</span> — one per visible line.
-  // Reading those leaves directly avoids the SR-only duplicate that
-  // breaks positional innerText parsing.
-  //
-  // Strategy:
-  //   1. Find the entry's primary container (the 2nd <a> / data-view-name
-  //      "profile-component-entity" / the item itself).
-  //   2. Collect visible <span aria-hidden="true"> leaves in DOM order.
-  //   3. If none found, fall back to a visible-text-node walk + dedupe.
-  // ─────────────────────────────────────────────────────────────
-  function primaryContainer(item) {
-    // The detail/drill-down anchor (links[1], the /overlay/ or /edit/forms/
-    // link) holds the field cluster. But the entity anchor (links[0]) may
-    // hold more text because it wraps the logo + name. Pick whichever of
-    // the first two anchors exposes the MOST aria-hidden field spans —
-    // that's the true field cluster, regardless of raw text length.
-    const anchors = qa(item, "a[href]");
-    if (anchors.length >= 2) {
-      const cands = anchors.slice(0, 2);
-      let best = cands[0], bestN = -1;
-      for (const a of cands) {
-        const n = visibleAriaHiddenSpans(a).length;
-        if (n > bestN) { bestN = n; best = a; }
-      }
-      // Only trust the anchor if it actually carries fields; otherwise the
-      // item itself is a better field source (e.g. tabbed/card entries).
-      if (bestN > 0) return best;
-    }
-    const entity = q(item, '[data-view-name="profile-component-entity"]');
-    if (entity && visibleAriaHiddenSpans(entity).length) return entity;
-    return item;
-  }
-
-  function visibleAriaHiddenSpans(root) {
+  // Visible text under the given roots, one line per rendered block, in DOM
+  // order: [{ text, node }] where node is the element holding the first run
+  // of text (parsers use node.closest(...) to learn what a line belongs to).
+  // <br> inside a block becomes "\n" so multi-paragraph descriptions survive.
+  function extractLines(rootList, skip) {
     const out = [];
-    for (const span of qa(root, 'span[aria-hidden="true"]')) {
-      if (isVisuallyHidden(span)) continue;
-      // Skip spans nested inside another matched span — we want leaves
-      if (span.querySelector('span[aria-hidden="true"]')) continue;
-      const t = clean(span.innerText || span.textContent);
-      if (t && !JUNK.has(t.toLowerCase())) out.push(t);
+    const styles = new Map();
+    const styleOf = el => {
+      let s = styles.get(el);
+      if (!s) { s = el.ownerDocument.defaultView.getComputedStyle(el); styles.set(el, s); }
+      return s;
+    };
+    let cur = null;
+    const flush = () => {
+      if (!cur) return;
+      const text = tidy(cur.text);
+      if (text && !isJunk(text)) out.push({ text, node: cur.node });
+      cur = null;
+    };
+    const walk = (node, pre, isRoot) => {
+      if (node.nodeType === 3) {
+        const v = pre ? node.nodeValue : node.nodeValue.replace(/\s+/g, " ");
+        if (!v.trim()) { if (cur) cur.text += v; return; }
+        if (!cur) cur = { text: "", node: node.parentElement };
+        cur.text += v;
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const tag = node.localName;
+      if (tag === "br") { if (cur) cur.text += "\n"; return; }
+      if (!isRoot && (SKIP_TAGS.has(tag) || (skip && skip(node)))) return;
+      const s = styleOf(node);
+      if (!isRoot && isHidden(node, s)) return;
+      const block = !INLINE.has(s.display);
+      if (block) flush();
+      const childPre = PRE_RX.test(s.whiteSpace);
+      for (const c of node.childNodes) walk(c, childPre, false);
+      if (block) flush();
+    };
+    for (const r of rootList) { walk(r, false, true); flush(); }
+    return out;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // ENTRIES
+  // ─────────────────────────────────────────────────────────────
+  const ENTRY_SEL = '[componentkey^="entity-collection-item"]';
+  const LEGACY_ENTRY_SEL = 'li.pvs-list__paged-list-item, li.artdeco-list__item, [data-view-name="profile-component-entity"]';
+
+  function topLevel(nodes) {
+    const set = new Set(nodes);
+    return nodes.filter(n => {
+      for (let p = n.parentElement; p; p = p.parentElement) if (set.has(p)) return false;
+      return true;
+    });
+  }
+
+  // Lists without per-entry wrappers (interests, recommendations) separate
+  // entries with <hr>s; group the siblings between them.
+  function splitByRules(container) {
+    const hr = container.querySelector("hr");
+    if (!hr) return [];
+    const groups = [];
+    let g = [];
+    for (const c of hr.parentElement.children) {
+      if (c.localName === "hr") { if (g.length) groups.push(g); g = []; }
+      else g.push(c);
+    }
+    if (g.length) groups.push(g);
+    return groups.filter(grp => grp.some(e => (e.textContent || "").trim()));
+  }
+
+  function findEntries(container, sel) {
+    if (!container) return [];
+    if (sel) return topLevel(qa(container, sel));
+    let items = topLevel(qa(container, ENTRY_SEL));
+    if (items.length) return items;
+    items = topLevel(qa(container, LEGACY_ENTRY_SEL));
+    if (items.length) return items;
+    items = splitByRules(container);
+    if (items.length) return items;
+    // A lazy column holding a single entry has no <hr> to split on.
+    if (container.matches('[data-testid="lazy-column"]')) {
+      return Array.from(container.children).filter(c => c.localName !== "hr" && (c.textContent || "").trim());
+    }
+    return topLevel(qa(container, '[role="listitem"], li'));
+  }
+
+  function decodeHref(href) {
+    try {
+      const u = new URL(href, location.href);
+      if (/\/(safety\/go|redir\/redirect)\/?$/.test(u.pathname)) return u.searchParams.get("url") || u.href;
+      return u.href;
+    } catch (_) { return href || ""; }
+  }
+  const isLinkedIn = h => /^https?:\/\/([a-z0-9-]+\.)*linkedin\.com(\/|$)/i.test(h);
+
+  function externalLinks(entry, except) {
+    const out = [];
+    for (const a of qe(entry, "a[href]")) {
+      if (a === except) continue;
+      const h = decodeHref(a.getAttribute("href"));
+      if (/^https?:/i.test(h) && !isLinkedIn(h) && !out.includes(h)) out.push(h);
     }
     return out;
   }
 
-  function visibleTextWalk(root, opts = {}) {
-    // Walk text nodes, skipping visually-hidden + nested listitem subtrees.
+  function orgUrl(entry) {
+    const a = qe(entry, "a[href]").find(x => /linkedin\.com\/(company|school|showcase)\//.test(x.href));
+    return a ? a.href.split("?")[0] : "";
+  }
+
+  const MEDIA_HREF_RX = /\/treasury(\/|\?|$)/i;
+  const SKILLS_HREF_RX = /skill-associations/i;
+
+  // Owner-only controls inside an entry, e.g. a recommendation's
+  // "All LinkedIn members [On]" visibility switch.
+  const isControlBlock = el =>
+    !!el.querySelector('input[role="switch"]') && !el.querySelector('[data-testid="expandable-text-box"], a[href]');
+
+  function entryLines(entry) {
+    const lines = extractLines(roots(entry), isControlBlock);
+    for (const l of lines) {
+      const a = l.node.closest("a[href]");
+      l.anchor = a && within(entry, a) ? a : null;
+      const href = l.anchor ? l.anchor.getAttribute("href") || "" : "";
+      l.desc = !!l.node.closest('[data-testid="expandable-text-box"], .inline-show-more-text, .pv-shared-text-with-see-more');
+      l.skills = /^skills:/i.test(l.text) || SKILLS_HREF_RX.test(href);
+      l.media = !l.skills && MEDIA_HREF_RX.test(href);
+    }
+    return lines;
+  }
+  const plain = lines => lines.filter(l => !l.media && !l.skills);
+
+  // Attachments: each treasury link holds a title line and maybe a description.
+  function collectMedia(lines) {
+    const groups = new Map();
+    for (const l of lines) {
+      if (!l.media) continue;
+      if (!groups.has(l.anchor)) groups.set(l.anchor, []);
+      groups.get(l.anchor).push(l.text);
+    }
+    return [...groups.values()].map(ts => (ts.length > 1 ? { title: ts[0], description: ts.slice(1).join("\n") } : { title: ts[0] }));
+  }
+
+  // "Skills: Swift (Programming Language), iOS Development, +2 skills"
+  function parseSkillsLines(lines) {
     const out = [];
-    const skipRoles = opts.skipNestedItems !== false;
-    function walk(node) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        const t = clean(node.nodeValue);
-        if (t && !JUNK.has(t.toLowerCase())) out.push(t);
-        return;
-      }
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-      if (isVisuallyHidden(node)) return;
-      if (skipRoles && node !== root) {
-        const role = (node.getAttribute("role") || "").toLowerCase();
-        if (node.tagName === "LI" || role === "listitem") return;
-      }
-      for (const c of node.childNodes) walk(c);
+    let more = 0;
+    for (const l of lines) {
+      let t = l.text.replace(/^skills:\s*/i, "");
+      t = t.replace(/(?:,\s*|\s+and\s+)?\+(\d+)\s+skills?$/i, (_, n) => { more += +n; return ""; });
+      for (const s of t.split(/\s*,\s*/)) if (s && !out.includes(s)) out.push(s);
     }
-    walk(root);
-    return out.filter((t, i) => t !== out[i - 1]);
+    if (more) out.push(`+${more} more`);
+    return out;
   }
 
-  function itemFields(item) {
-    if (!item) return [];
-    const container = primaryContainer(item);
-    let spans = visibleAriaHiddenSpans(container);
-    if (spans.length < 2) {
-      // Too few spans from the chosen container — broaden to the whole item,
-      // which catches entries where the field cluster isn't under an anchor
-      // (tabbed recommendations, bare div entries on detail pages).
-      const itemSpans = visibleAriaHiddenSpans(item);
-      if (itemSpans.length > spans.length) spans = itemSpans;
-    }
-    if (spans.length) {
-      // Strip noise: image filenames, section headings, "show/see more".
-      const cleaned = spans
-        .map(s => stripFilenameNoise(s))                 // drop *.jpg/*.png tokens
-        .map(s => clean(s))
-        .filter(s => s && !isNoiseField(s) && !JUNK.has(s.toLowerCase()))
-        .filter(s => !/^(show|see|view)\b/i.test(s) || s.length > 30);
-      return dedupeSeq(cleaned);
-    }
-    // Last resort: visible text-node walk.
-    const walked = visibleTextWalk(container);
-    return walked.length ? walked : visibleTextWalk(item);
-  }
-
-  // Top-level item header line (company name for a multi-role experience item)
-  function itemHeader(item) {
-    const spans = visibleAriaHiddenSpans(item);
-    return spans[0] || "";
-  }
-
-  function dedupeSeq(arr) {
-    return arr.filter((t, i) => t !== arr[i - 1]);
-  }
-
-  // First non-empty visible text from a list of selectors (a11y-first)
-  function firstText(root, ...sels) {
-    for (const sel of sels) {
-      try {
-        const el = (root || document).querySelector(sel);
-        if (el && !isVisuallyHidden(el)) {
-          const t = clean(el.innerText || el.textContent);
-          if (t) return t;
-        }
-      } catch (_) {}
-    }
-    return "";
-  }
-
-  // Legacy helper kept for header/about-style extraction
-  function getTexts(el) {
-    if (!el) return [];
-    return visibleTextWalk(el);
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // MODE DETECTION
-  // ─────────────────────────────────────────────────────────────
-  function detectMode() {
-    const path = window.location.pathname;
-    const m    = path.match(/\/in\/[^/?#]+\/details\/([^/?#]+)/);
-    if (m) {
-      const slug    = m[1].toLowerCase();
-      const section = SECTION_MAP[slug] || slug;
-      return { mode: "detail", section, slug };
-    }
-    if (/\/in\/[^/?#]+\/?$/.test(path) || /\/in\/[^/?#]+$/.test(path)) return { mode: "main" };
-    return { mode: "unknown" };
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // LIST / ITEM HELPERS
-  // ─────────────────────────────────────────────────────────────
-  const isListEl = el => {
-    const role = (el.getAttribute?.("role") || "").toLowerCase();
-    return role === "list" || el.tagName === "UL" || el.tagName === "OL";
-  };
-  const isItemEl = el => {
-    const role = (el.getAttribute?.("role") || "").toLowerCase();
-    return role === "listitem" || el.tagName === "LI" ||
-           (el.className || "").toString().includes("pvs-list__paged-list-item");
-  };
-  const listScore = el => (el.innerText || "").length;
-
-  // ─────────────────────────────────────────────────────────────
-  // getItems()  —  v8.1 cascade (no assumption of role="list" wrapper)
-  //   Returns { items, via } when getItemsDebug is used; plain array otherwise.
-  // ─────────────────────────────────────────────────────────────
-  function getItemsDebug(root) {
-    if (!root) return { items: [], via: "empty-root" };
-
-    // ── Strategy 1: root IS a list → its direct item children ──
-    if (isListEl(root)) {
-      const direct = Array.from(root.children).filter(isItemEl);
-      if (direct.length) return { items: direct, via: "1-root-is-list" };
-    }
-
-    // ── Strategy 2: best child [role="list"] / <ul> / pvs container ──
-    const childLists = qa(root, '[role="list"], ul, ol, .pvs-list__container');
-    if (childLists.length) {
-      const best = childLists.reduce((a, b) => listScore(b) > listScore(a) ? b : a);
-      if (listScore(best) > 10) {
-        const direct = Array.from(best.children).filter(isItemEl);
-        if (direct.length) return { items: direct, via: "2-child-list" };
-      }
-    }
-
-    // ── Strategy 3: bare role="listitem" anywhere in root (top-level only) ──
-    const bareItems = qa(root, '[role="listitem"], li, .pvs-list__paged-list-item');
-    if (bareItems.length) {
-      const topLevel = bareItems.filter(item => {
-        const parent = item.parentElement?.closest('[role="listitem"], li, .pvs-list__paged-list-item');
-        return !parent || !root.contains(parent);
-      });
-      if (topLevel.length) return { items: topLevel, via: "3-bare-listitem" };
-    }
-
-    // ── Strategy 4: discover entries by their drill-down anchor ──
-    // On some detail views (certifications, licenses) entries are bare <div>s
-    // with NO role="listitem", NO <li>, NO role="list" wrapper. The one stable
-    // marker is the drill-down <a>: /overlay/... (others) or /edit/forms/...
-    // (own profile). Anchor on these and walk up to the entry container.
-    const DRILL_RX = /\/(overlay|edit\/forms)\//;
-    const drillAnchors = qa(root, 'a[href]').filter(a => DRILL_RX.test(a.getAttribute("href") || ""));
-    if (drillAnchors.length) {
-      const items = discoverItemsByAnchors(root, drillAnchors);
-      if (items.length) return { items, via: "4-drill-anchor" };
-    }
-
-    return { items: [], via: "none" };
-  }
-
-  // ── Strategy 4 core: find entries via drill-down anchors ──────────
-  //  On detail pages (certs, honors, …) entries are bare <div>s with NO
-  //  role="listitem", NO <li>, NO role="list" wrapper. The one stable marker
-  //  is the drill-down <a>, whose URL carries a numeric entity id. LinkedIn
-  //  uses several shapes — all must resolve to the SAME id or grouping fails:
-  //    /overlay/715414005/skill-associations-details/    (id FIRST)
-  //    /overlay/Certifications/539964024/treasury/...    (word, then id)
-  //    /details/certifications/edit/forms/715414005/     (edit, then id)
-  //    /edit/forms/position/2825858466/                  (section-less edit)
-  //  The word segment is LETTERS-only ([a-z_-]*) — never `[^/]*`, which would
-  //  greedily eat leading digits when the id comes first. ≥4 digits filters
-  //  out /edit/forms/new/ and stray counters.
-  //
-  //  Algorithm (single-pass, robust to entries having 1 OR many anchors):
-  //    1. Extract ids, group anchors by id (drops id-less "Add" buttons).
-  //    2. For each id-group, find the ENTRY = nearest ancestor of any anchor
-  //       whose parent contains multiple text-bearing siblings (that's the
-  //       repeated entry block in the list). LCA is only used when a group
-  //       has ≥2 anchors, to avoid picking one anchor's narrow wrapper.
-  //    3. Dedupe entries by node identity (multiple ids may resolve to the
-  //       same entry only when anchors share a wrapper — rare). Order by DOM.
-  const ENTITY_ID_RX = /\/overlay\/[a-z_-]*\/?(\d{4,})|\/edit\/forms\/(?:[a-z_]+\/)?(\d{4,})/i;
-
-  function entityIdFromHref(href) {
-    const m = String(href || "").match(ENTITY_ID_RX);
-    if (!m) return "";
-    return m[1] || m[2] || "";
-  }
-
-  // Lowest Common Ancestor of a node set — used when a group has ≥2 anchors.
-  function lowestCommonAncestor(nodes) {
-    if (!nodes.length) return null;
-    const path = (n) => {
-      const p = [n]; let cur = n;
-      while (cur.parentElement) { cur = cur.parentElement; p.push(cur); }
-      return p;
+  function extras(entry, lines) {
+    return {
+      skills: parseSkillsLines(lines.filter(l => l.skills)),
+      media: collectMedia(lines),
+      links: externalLinks(entry),
     };
-    const common = new Set(path(nodes[0]));
-    for (const n of nodes.slice(1)) {
-      const np = new Set(path(n));
-      let overlap = false;
-      for (const x of common) { if (np.has(x)) { overlap = true; break; } }
-      if (!overlap) return null;
-      for (const x of Array.from(common)) if (!np.has(x)) common.delete(x);
-      if (!common.size) return null;
-    }
-    let best = null, bestDepth = -1;
-    for (const x of common) {
-      let d = 0, c = x;
-      while (c.parentElement) { d++; c = c.parentElement; }
-      if (d > bestDepth) { bestDepth = d; best = x; }
-    }
-    return best;
-  }
-
-  // Walk one node up until its parent contains ≥2 text-bearing children —
-  // i.e. until this node sits among repeated sibling entries. Returns null
-  // if we hit root first. This finds the ENTRY for a single anchor without
-  // needing LCA (which collapses to the anchor itself for singletons).
-  function promoteToEntry(node, root) {
-    if (!node || node === root) return null;
-    for (let cur = node; cur && cur !== root; cur = cur.parentElement) {
-      const parent = cur.parentElement;
-      if (!parent || parent === root) break;
-      const sibs = Array.from(parent.children).filter(c =>
-        c.nodeType === 1 && (c.innerText || "").trim().length > 5);
-      // cur is one of several entry-shaped siblings → cur is an entry.
-      if (sibs.length >= 2 && sibs.includes(cur)) return cur;
-    }
-    // Fallback: return the deepest non-anchor, non-root ancestor with text.
-    let best = null;
-    for (let cur = node; cur && cur !== root; cur = cur.parentElement) {
-      if (cur.tagName === "A" || cur.tagName === "IMG" || cur.tagName === "BUTTON") continue;
-      if ((cur.innerText || "").trim().length >= 5) { best = cur; break; }
-    }
-    return best;
-  }
-
-  function discoverItemsByAnchors(root, drillAnchors) {
-    // 1) Group anchors by entity id (drops id-less "Add new" buttons).
-    const byId = new Map();
-    for (const a of drillAnchors) {
-      const id = entityIdFromHref(a.getAttribute("href") || "");
-      if (!id) continue;
-      if (!byId.has(id)) byId.set(id, []);
-      byId.get(id).push(a);
-    }
-    if (!byId.size) return [];
-
-    // 2) One entry per id-group.
-    const entryById = new Map();   // id → entry node (for diagnostics)
-    const entries = [];
-    for (const [id, anchors] of byId) {
-      let seed = anchors.length >= 2 ? lowestCommonAncestor(anchors) : anchors[0];
-      if (!seed || seed === root) continue;
-      const entry = promoteToEntry(seed, root);
-      if (!entry || entry === root) continue;
-      entryById.set(id, entry);
-      entries.push(entry);
-    }
-    if (!entries.length) return [];
-
-    // 3) Dedupe by node identity (distinct ids rarely share an entry, but
-    //    guard anyway). Then sort in DOM order.
-    const unique = [];
-    const seen = new Set();
-    for (const e of entries) {
-      if (seen.has(e)) continue;
-      seen.add(e);
-      unique.push(e);
-    }
-    unique.sort((a, b) => {
-      if (a === b) return 0;
-      const rel = a.compareDocumentPosition(b);
-      if (rel & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-      if (rel & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-      return 0;
-    });
-    return unique;
-  }
-
-  // True for fields that are noise (image filenames, section headings).
-  function isNoiseField(s) {
-    const t = clean(s).toLowerCase();
-    if (IMAGE_FILE_RX.test(t)) return true;
-    if (SECTION_HEADING_SET.has(t)) return true;
-    return false;
-  }
-
-  // Strip image-filename tokens (foo.jpg, bar.png) from a field. These leak
-  // in because LinkedIn names credential/award images after their content and
-  // exposes the filename as an aria-hidden span. Pure-filename fields become
-  // empty so the downstream filter drops them; embedded filenames are removed
-  // and the rest of the line is kept.
-  function stripFilenameNoise(s) {
-    if (!s) return s;
-    const stripped = String(s).replace(/\b[\w.-]+\.(jpe?g|png|gif|webp|svg|bmp|tiff?|heic)\b/gi, "");
-    return stripped;
-  }
-
-  const IMAGE_FILE_RX = /\.(jpe?g|png|gif|webp|svg|bmp|tiff?|heic)$/i;
-  const SECTION_HEADING_SET = new Set([
-    "licenses & certifications", "licenses and certifications",
-    "experience", "education", "skills", "about", "honors & awards",
-    "honors and awards", "honors", "awards", "publications", "projects",
-    "volunteer experience", "volunteering", "languages", "courses",
-    "recommendations", "organizations", "patents", "interests",
-  ]);
-
-  function getItems(root) {
-    return getItemsDebug(root).items;
-  }
-
-  // Items across all tabpanels of a tablist (Recommendations / Interests).
-  function getTabbedItems(root) {
-    const panels = qa(root, '[role="tabpanel"]');
-    if (!panels.length) return null;
-    const all = [];
-    for (const p of panels) {
-      const items = getItems(p);
-      for (const it of items) if (!all.includes(it)) all.push(it);
-    }
-    return all.length ? all : null;
   }
 
   // ─────────────────────────────────────────────────────────────
-  // DETAIL ROOT FINDER — anchors to "primary content" region
+  // FIELD PATTERNS
   // ─────────────────────────────────────────────────────────────
-  function getDetailRoot() {
-    const main = q(document, '[role="main"]') || q(document, "main") || document.body;
+  const MON = "(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\\.?";
+  const DTOK = `(?:${MON}\\s+)?(?:\\d{1,2},?\\s+)?\\d{4}|present`;
+  const RANGE_RX = new RegExp(`^(${DTOK})\\s*[-–—]\\s*(${DTOK})$`, "i");
+  const SINGLE_RX = new RegExp(`^(${MON}\\s+(?:\\d{1,2},?\\s+)?\\d{4}|\\d{4})$`, "i");
+  const DUR_RX = /^(?:less than a year|\d+\s*(?:yrs?|years?|mos?|months?)(?:\s+\d+\s*(?:mos?|months?))?)$/i;
+  const EMP_RX = /^(full[- ]time|part[- ]time|self[- ]employed|freelance|contract|internship|apprenticeship|seasonal|temporary|permanent|trainee)$/i;
+  const WORKPLACE_RX = /^(on[- ]site|remote|hybrid)$/i;
+  const ASSOC_RX = /^associated with\s+/i;
 
-    // Priority 1: named "primary content" region
-    const CONTENT_NAMES = ["primary content", "main content"];
-    const regions = qa(main, '[role="region"], section, [aria-label], [aria-labelledby]');
-    for (const region of regions) {
-      const name = accessibleName(region);
-      if (!name) continue;
-      if (CONTENT_NAMES.some(n => name.includes(n))) {
-        const lists = qa(region, '[role="list"], ul');
-        if (lists.length) {
-          const best = lists.reduce((a, b) => listScore(b) > listScore(a) ? b : a);
-          if (listScore(best) > 10) return best;
-        }
-        return region;
-      }
+  // "Sep 2025 - Present · 1 yr 2 mos" → { dates, duration }
+  function parseDates(s) {
+    const parts = s.split(/\s+·\s+/).map(p => p.trim());
+    if (RANGE_RX.test(parts[0]) || SINGLE_RX.test(parts[0])) {
+      return { dates: parts[0], duration: parts.slice(1).find(p => DUR_RX.test(p)) || "" };
     }
-
-    // Priority 2: richest list anywhere in main
-    const allLists = qa(main, '[role="list"], ul');
-    if (allLists.length) {
-      const best = allLists.reduce((a, b) => listScore(b) > listScore(a) ? b : a);
-      if (listScore(best) > 10) return best;
-    }
-
-    return main;
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // SECTION FINDER — main profile page (a11y-first)
-  //   1. h2/h3 heading text
-  //   2. data-view-name="profile-card" with matching aria-label
-  //   3. any region/section with matching accessible name
-  //   4. id contains keyword
-  // ─────────────────────────────────────────────────────────────
-  const SECTION_ALIASES = {
-    "certifications":  ["licenses", "certification", "credential"],
-    "experience":      ["experience"],
-    "education":       ["education"],
-    "skills":          ["skills"],
-    "projects":        ["projects"],
-    "volunteering":    ["volunteer"],
-    "languages":       ["languages"],
-    "honors":          ["honors", "awards", "honors & awards"],
-    "publications":    ["publications"],
-    "courses":         ["courses"],
-    "recommendations": ["recommendations"],
-    "organizations":   ["organizations", "organization"],
-    "patents":         ["patents"],
-    "interests":       ["interests"],
-  };
-
-  function sectionNameMatches(name, keyword) {
-    if (!name) return false;
-    const aliases = SECTION_ALIASES[keyword] || [keyword];
-    return aliases.some(a => name.includes(a));
-  }
-
-  function findSection(keyword) {
-    const kw = keyword.toLowerCase();
-
-    // 1. Heading text (most stable)
-    for (const h of qa(document, "h2, h3")) {
-      const t = clean(h.innerText || h.textContent).toLowerCase();
-      if (sectionNameMatches(t, kw)) {
-        const sec = h.closest("section") || h.closest('[data-view-name="profile-card"]') || h.parentElement;
-        if (sec) return sec;
-      }
-    }
-
-    // 2. data-view-name="profile-card" by accessible name
-    for (const card of qa(document, '[data-view-name="profile-card"], section, [role="region"]')) {
-      if (sectionNameMatches(accessibleName(card), kw)) return card;
-    }
-
-    // 3. aria-labeled divs
-    for (const el of qa(document, 'div[aria-label], div[aria-labelledby]')) {
-      if (sectionNameMatches(accessibleName(el), kw)) return el;
-    }
-
-    // 4. id fallback
-    try {
-      const byId = document.querySelector(`section[id*="${kw}"], div[id*="${kw}-section"]`);
-      if (byId) return byId.closest("section") || byId;
-    } catch (_) {}
+    if (parts.length === 1 && DUR_RX.test(parts[0])) return { dates: "", duration: parts[0] };
     return null;
   }
 
   // ─────────────────────────────────────────────────────────────
-  // DATE / FIELD PATTERNS
-  //   LinkedIn date strings: "Jan 2020 - Present · 3 yrs 2 mos"
-  //   Split on "·" (range|duration) then " - " (from|to).
+  // SECTION PARSERS  (entry element → object, or array for grouped roles)
   // ─────────────────────────────────────────────────────────────
-  const DATE_RX   = /([A-Z][a-z]{2,8}\.?\s+\d{4}|Present|\d{4})\s*[–\-—]\s*([A-Z][a-z]{2,8}\.?\s+\d{4}|Present|\d{4})/;
-  const YEAR_RX   = /\d{4}\s*[–\-—]\s*(\d{4}|Present)/;
-  const DUR_RX    = /\d+\s*(yr|yrs|mo|mos)/i;
-  const ISSUED_RX = /^issued/i;
-  const EXPIRY_RX = /expir/i;
-  const CRED_RX   = /credential\s*id/i;
-  const isDate    = s => DATE_RX.test(s) || YEAR_RX.test(s);
-  const isDur     = s => DUR_RX.test(s);
-
-  // Pull (range, duration) out of a combined "Range · Duration" string.
-  function splitDateAndDuration(s) {
-    if (!s) return { date: "", duration: "" };
-    const parts = s.split(/\s*·\s*/);
-    let date = "", duration = "";
-    for (const p of parts) {
-      if (!date && (isDate(p) || /\b(Present|present)\b/.test(p))) date = p;
-      else if (!duration && isDur(p)) duration = p;
-    }
-    if (!date && parts[0]) date = parts[0];
-    return { date: clean(date), duration: clean(duration) };
-  }
-
-  // Employment-type label LinkedIn inserts between title and company.
-  // Real-world examples from debug: "Full-time", "Part-time", "Contract",
-  // "Freelance", "Internship", "Self-employed", "Temporary", "Apprenticeship".
-  const EMP_TYPE_RX = /^(full[-\s]?time|part[-\s]?time|contract|freelance|internship|self[-\s]?employed|temporary|apprenticeship|seasonal|commission)$/i;
-  const isEmpType   = s => EMP_TYPE_RX.test(clean(s));
-  // "Skills" line that sometimes follows: "· 3 skills" / "1 skill"
-  const isSkillsLine = s => /^\d+\s+skill/i.test(clean(s));
-
-  // First non-/in/ non-/company/ external link = credential/project URL
-  function externalUrl(item) {
-    for (const a of qa(item, "a[href]")) {
-      const href = a.href || "";
-      if (!href) continue;
-      if (/linkedin\.com\/(in|company|school)\//.test(href)) continue;
-      if (/linkedin\.com\/in\//.test(href)) continue;
-      if (/^https?:\/\//.test(href)) return href;
-    }
-    return "";
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // SECTION EXTRACTORS
-  // ─────────────────────────────────────────────────────────────
-  function extractHeader() {
-    return {
-      name:        firstText(document, "h1.text-heading-xlarge", '[role="main"] h1', "main h1", "h1"),
-      headline:    firstText(document, ".text-body-medium.break-words", ".text-body-medium"),
-      location:    firstText(document, ".text-body-small.inline.t-black--light.break-words", ".text-body-small.t-black--light"),
-      connections: firstText(document, "a[href*='connections'] span.t-bold", ".pvs-header__optional-link .t-bold", "a[href*='connections'] .t-bold"),
-    };
-  }
-
-  function extractAbout() {
-    const sec = findSection("about") || q(document, "section[data-section='summary']");
-    if (!sec) return "";
-    const texts = getTexts(sec);
-    // About is the longest non-heading line (skip the "About" heading itself)
-    return texts.reduce((a, b) => (b.length > a.length && b.toLowerCase() !== "about") ? b : a, "");
-  }
-
-  // Pull the longest "description-like" remaining string (heuristic).
-  function pickDescription(rest, minLen = 30) {
-    return rest.find(s => s.length >= minLen) || "";
-  }
-
-  function parseExpItem(item, overrideCompany) {
-    const fields = itemFields(item);
-    let dateStr = "", durStr = "";
-    // First pass: peel off dates/durations, and drop employment-type +
-    // skill-count noise lines that would otherwise shift positions.
-    const rest = fields.filter(s => {
-      if (isEmpType(s) || isSkillsLine(s)) return false;
-      if (!dateStr && (isDate(s) || isDur(s))) {
-        const split = splitDateAndDuration(s);
-        if (split.date) { dateStr = split.date; durStr = durStr || split.duration; return false; }
-        if (isDur(s) && !durStr) { durStr = s; return false; }
-      }
-      return true;
-    });
+  function parsePosition(lines, company) {
     const e = {
-      title:    rest[0] || "",
-      company:  overrideCompany || rest[1] || "",
-      duration: [dateStr, durStr].filter(Boolean).join(" · "),
-      location: "", description: "",
+      title: "", company: company || "", employmentType: "", dates: "", duration: "", totalTenure: "",
+      location: "", workplace: "", description: "", skills: [], media: [], links: [], companyUrl: "", details: [],
     };
-    rest.slice(overrideCompany ? 1 : 2).forEach(s => {
-      if (!e.location && s.length < 60)          e.location    = s;
-      else if (!e.description && s.length >= 30) e.description = s;
-    });
+    const desc = [];
+    let afterDates = false, haveCompany = !!company;
+    for (const l of plain(lines)) {
+      const t = l.text;
+      if (!e.title) { e.title = t; continue; }
+      if (l.desc) { desc.push(t); continue; }
+      if (!e.dates && !e.duration) {
+        const d = parseDates(t);
+        if (d) { e.dates = d.dates; e.duration = d.duration; afterDates = true; continue; }
+      }
+      if (EMP_RX.test(t)) { e.employmentType = t; continue; }
+      if (!haveCompany && !afterDates) {
+        const parts = t.split(/\s+·\s+/);
+        if (parts.length > 1 && EMP_RX.test(parts[parts.length - 1])) e.employmentType = parts.pop();
+        e.company = parts.join(" · ");
+        haveCompany = true;
+        continue;
+      }
+      if (afterDates && !e.location && !e.workplace && t.length <= 120) {
+        const parts = t.split(/\s+·\s+/);
+        if (WORKPLACE_RX.test(parts[parts.length - 1])) e.workplace = parts.pop();
+        e.location = parts.join(" · ");
+        continue;
+      }
+      if (t.length > 160) { desc.push(t); continue; }
+      e.details.push(t);
+    }
+    e.description = desc.join("\n");
     return e;
   }
 
-  function extractExperience(root) {
-    root = root || findSection("experience");
-    if (!root) return [];
-    const entries = [];
-    for (const item of getItems(root)) {
-      // Detect nested positions: item has its own sub-list of roles
-      const subItems = getItems(item).filter(s => s !== item);
-      if (subItems.length > 0) {
-        const company = itemHeader(item) || "";
-        for (const sub of subItems) {
-          const e = parseExpItem(sub, company);
-          if (e.title) entries.push(e);
-        }
-      } else {
-        const e = parseExpItem(item);
-        if (e.title) entries.push(e);
+  function parseExperience(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return [];
+    // Several roles at one company: header (company, total tenure) + one <li> per role.
+    const roles = topLevel(qe(entry, "li")).filter(li => lines.some(l => li.contains(l.node) && parseDates(l.text)));
+    if (roles.length) {
+      const head = plain(lines.filter(l => !roles.some(li => li.contains(l.node))));
+      const company = head[0] ? head[0].text : "";
+      const tenure = head.slice(1).map(l => parseDates(l.text)).find(Boolean);
+      return roles.map(li => {
+        const ls = lines.filter(l => li.contains(l.node));
+        return Object.assign(parsePosition(ls, company), extras(li, ls), {
+          companyUrl: orgUrl(entry),
+          totalTenure: tenure ? tenure.duration || tenure.dates : "",
+        });
+      });
+    }
+    return [Object.assign(parsePosition(lines, ""), extras(entry, lines), { companyUrl: orgUrl(entry) })];
+  }
+
+  function parseEducation(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return null;
+    const e = {
+      school: "", degree: "", field: "", dates: "", grade: "", activities: "", description: "",
+      skills: [], media: [], links: [], schoolUrl: orgUrl(entry), details: [],
+    };
+    const desc = [];
+    for (const l of plain(lines)) {
+      const t = l.text;
+      if (!e.school) { e.school = t; continue; }
+      if (/^grade:/i.test(t)) { e.grade = t.replace(/^grade:\s*/i, ""); continue; }
+      if (/^activities and societies:/i.test(t)) { e.activities = t.replace(/^activities and societies:\s*/i, ""); continue; }
+      if (l.desc) { desc.push(t); continue; }
+      if (!e.dates) {
+        const d = parseDates(t);
+        if (d) { e.dates = [d.dates, d.duration].filter(Boolean).join(" · "); continue; }
       }
+      if (!e.degree && !e.dates) {
+        const i = t.indexOf(", ");
+        if (i > 0) { e.degree = t.slice(0, i); e.field = t.slice(i + 2); } else e.degree = t;
+        continue;
+      }
+      if (t.length > 160) { desc.push(t); continue; }
+      e.details.push(t);
+    }
+    e.description = desc.join("\n");
+    return Object.assign(e, extras(entry, lines));
+  }
+
+  function parseCertification(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return null;
+    const e = {
+      name: "", issuer: "", issued: "", expires: "", credentialId: "", credentialUrl: "", description: "",
+      skills: [], media: [], links: [], details: [],
+    };
+    const desc = [];
+    for (const l of plain(lines)) {
+      const t = l.text;
+      if (!e.name) { e.name = t; continue; }
+      if (/^issued\b/i.test(t) && !/^issued by\b/i.test(t)) {
+        for (const p of t.split(/\s+·\s+/)) {
+          if (/^issued\b/i.test(p)) e.issued = p.replace(/^issued\s*/i, "");
+          else if (/no expiration/i.test(p)) e.expires = "No expiration date";
+          else if (/^expire[sd]?\b/i.test(p)) e.expires = p.replace(/^expire[sd]?\s*/i, "");
+          else e.details.push(p);
+        }
+        continue;
+      }
+      if (/^expire[sd]?\b/i.test(t)) { e.expires = t.replace(/^expire[sd]?\s*/i, ""); continue; }
+      if (/^credential id\b/i.test(t)) { e.credentialId = t.replace(/^credential id[:\s]*/i, ""); continue; }
+      if (!e.issuer && !e.issued && !l.desc) { e.issuer = t; continue; }
+      if (l.desc || t.length > 160) { desc.push(t); continue; }
+      e.details.push(t);
+    }
+    e.description = desc.join("\n");
+    const cred = qe(entry, "a[href]").find(a => /credential/i.test(a.getAttribute("aria-label") || a.textContent || ""));
+    Object.assign(e, extras(entry, lines));
+    if (cred) {
+      e.credentialUrl = decodeHref(cred.getAttribute("href"));
+      e.links = e.links.filter(h => h !== e.credentialUrl);
+    }
+    return e;
+  }
+
+  function parseProject(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return null;
+    const e = { name: "", dates: "", associatedWith: "", description: "", url: "", skills: [], media: [], links: [], details: [] };
+    const desc = [];
+    for (const l of plain(lines)) {
+      const t = l.text;
+      if (!e.name) { e.name = t; continue; }
+      if (ASSOC_RX.test(t)) { e.associatedWith = t.replace(ASSOC_RX, ""); continue; }
+      if (!e.dates) {
+        const d = parseDates(t);
+        if (d) { e.dates = [d.dates, d.duration].filter(Boolean).join(" · "); continue; }
+      }
+      if (l.desc || t.length > 160) { desc.push(t); continue; }
+      e.details.push(t);
+    }
+    e.description = desc.join("\n");
+    Object.assign(e, extras(entry, lines));
+    if (e.links.length) e.url = e.links.shift();
+    return e;
+  }
+
+  function parseVolunteering(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return null;
+    const e = { role: "", organization: "", dates: "", duration: "", cause: "", description: "", media: [], links: [], details: [] };
+    const desc = [];
+    let afterDates = false;
+    for (const l of plain(lines)) {
+      const t = l.text;
+      if (!e.role) { e.role = t; continue; }
+      if (l.desc) { desc.push(t); continue; }
+      if (!e.dates && !e.duration) {
+        const d = parseDates(t);
+        if (d) { e.dates = d.dates; e.duration = d.duration; afterDates = true; continue; }
+      }
+      if (!e.organization && !afterDates) { e.organization = t; continue; }
+      if (afterDates && !e.cause && t.length <= 80) { e.cause = t; continue; }
+      if (t.length > 160) { desc.push(t); continue; }
+      e.details.push(t);
+    }
+    e.description = desc.join("\n");
+    const x = extras(entry, lines);
+    e.media = x.media; e.links = x.links;
+    return e;
+  }
+
+  function parseHonor(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return null;
+    const e = { title: "", issuer: "", date: "", associatedWith: "", description: "", media: [], links: [], details: [] };
+    const desc = [];
+    for (const l of plain(lines)) {
+      const t = l.text;
+      if (!e.title) { e.title = t; continue; }
+      if (/^issued by\s+/i.test(t)) {
+        const parts = t.replace(/^issued by\s+/i, "").split(/\s+·\s+/);
+        e.issuer = parts.shift();
+        e.date = parts.join(" · ");
+        continue;
+      }
+      if (/^issued\s+/i.test(t)) { e.date = t.replace(/^issued\s+/i, ""); continue; }
+      if (ASSOC_RX.test(t)) { e.associatedWith = t.replace(ASSOC_RX, ""); continue; }
+      if (!e.date && SINGLE_RX.test(t)) { e.date = t; continue; }
+      if (l.desc || t.length > 160) { desc.push(t); continue; }
+      e.details.push(t);
+    }
+    e.description = desc.join("\n");
+    const x = extras(entry, lines);
+    e.media = x.media; e.links = x.links;
+    return e;
+  }
+
+  function parseCourse(entry) {
+    const lines = plain(entryLines(entry));
+    if (!lines.length) return null;
+    const e = { name: lines[0].text, number: "", associatedWith: "", details: [] };
+    for (const l of lines.slice(1)) {
+      if (ASSOC_RX.test(l.text)) e.associatedWith = l.text.replace(ASSOC_RX, "");
+      else if (!e.number && l.text.length <= 40) e.number = l.text;
+      else e.details.push(l.text);
+    }
+    return e;
+  }
+
+  function parseTestScore(entry) {
+    const lines = plain(entryLines(entry));
+    if (!lines.length) return null;
+    const e = { name: lines[0].text, score: "", date: "", associatedWith: "", description: "", details: [] };
+    const desc = [];
+    for (const l of lines.slice(1)) {
+      const t = l.text;
+      if (/^score:/i.test(t)) {
+        const parts = t.replace(/^score:\s*/i, "").split(/\s+·\s+/);
+        e.score = parts.shift();
+        e.date = parts.join(" · ");
+      } else if (ASSOC_RX.test(t)) e.associatedWith = t.replace(ASSOC_RX, "");
+      else if (l.desc || t.length > 160) desc.push(t);
+      else e.details.push(t);
+    }
+    e.description = desc.join("\n");
+    return e;
+  }
+
+  function parseLanguage(entry) {
+    const lines = plain(entryLines(entry));
+    if (!lines.length) return null;
+    return { language: lines[0].text, proficiency: lines[1] ? lines[1].text : "", details: lines.slice(2).map(l => l.text) };
+  }
+
+  // "Publisher · Jan 1, 2024" / "US 1234567 · Issued Jan 2020"
+  function splitMetaLine(t) {
+    const parts = t.split(/\s+·\s+/);
+    const dateIdx = parts.findIndex(p => SINGLE_RX.test(p.replace(/^(issued|filed)\s+/i, "")));
+    const date = dateIdx >= 0 ? parts.splice(dateIdx, 1)[0] : "";
+    return { main: parts.join(" · "), date };
+  }
+
+  function parsePublication(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return null;
+    const e = { title: "", publisher: "", date: "", description: "", url: "", links: [], details: [] };
+    const desc = [];
+    for (const l of plain(lines)) {
+      const t = l.text;
+      if (!e.title) { e.title = t; continue; }
+      if (!e.publisher && !e.date && !l.desc) { const m = splitMetaLine(t); e.publisher = m.main; e.date = m.date; continue; }
+      if (l.desc || t.length > 160) { desc.push(t); continue; }
+      e.details.push(t);
+    }
+    e.description = desc.join("\n");
+    e.links = externalLinks(entry);
+    if (e.links.length) e.url = e.links.shift();
+    return e;
+  }
+
+  function parsePatent(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return null;
+    const e = { title: "", number: "", date: "", description: "", url: "", links: [], details: [] };
+    const desc = [];
+    for (const l of plain(lines)) {
+      const t = l.text;
+      if (!e.title) { e.title = t; continue; }
+      if (!e.number && !e.date && !l.desc) { const m = splitMetaLine(t); e.number = m.main; e.date = m.date; continue; }
+      if (l.desc || t.length > 160) { desc.push(t); continue; }
+      e.details.push(t);
+    }
+    e.description = desc.join("\n");
+    e.links = externalLinks(entry);
+    if (e.links.length) e.url = e.links.shift();
+    return e;
+  }
+
+  function parseOrganization(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return null;
+    const e = { name: "", position: "", dates: "", associatedWith: "", description: "", details: [] };
+    const desc = [];
+    for (const l of plain(lines)) {
+      const t = l.text;
+      if (!e.name) { e.name = t; continue; }
+      if (ASSOC_RX.test(t)) { e.associatedWith = t.replace(ASSOC_RX, ""); continue; }
+      if (!e.position && !e.dates && !l.desc) {
+        const parts = t.split(/\s+·\s+/);
+        const i = parts.findIndex(p => parseDates(p));
+        if (i >= 0) e.dates = parts.splice(i, 1)[0];
+        e.position = parts.join(" · ");
+        continue;
+      }
+      if (l.desc || t.length > 160) { desc.push(t); continue; }
+      e.details.push(t);
+    }
+    e.description = desc.join("\n");
+    return e;
+  }
+
+  function parseRecommendation(entry) {
+    const lines = plain(entryLines(entry));
+    if (!lines.length) return null;
+    const e = { from: lines[0].text, headline: "", date: "", relationship: "", text: "", profileUrl: "", details: [] };
+    const a = qe(entry, "a[href]").find(x => /\/in\//.test(x.href));
+    if (a) e.profileUrl = a.href.split("?")[0];
+    const body = [];
+    for (const l of lines.slice(1)) {
+      const t = l.text;
+      const m = t.match(/^([A-Z][a-z]+ \d{1,2}, \d{4}),\s*(.+)$/);
+      if (m && !e.date) { e.date = m[1]; e.relationship = m[2]; continue; }
+      if (!e.headline && !l.desc && t.length <= 220 && !body.length) { e.headline = t; continue; }
+      if (l.desc || t.length > 80) { body.push(t); continue; }
+      e.details.push(t);
+    }
+    e.text = body.join("\n");
+    return e;
+  }
+
+  function parseSkill(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return null;
+    const s = { name: lines[0].text, category: "", endorsements: [], usedIn: [], details: [] };
+    for (const l of lines.slice(1)) {
+      const list = l.node.closest('[role="list"], ul');
+      if (/endors/i.test(l.text)) s.endorsements.push(l.text);
+      else if (list && within(entry, list)) s.usedIn.push(l.text);
+      else s.details.push(l.text);
+    }
+    return s;
+  }
+
+  function parseInterest(entry) {
+    const lines = plain(entryLines(entry));
+    if (!lines.length) return null;
+    const a = qe(entry, "a[href]")[0];
+    return { name: lines[0].text, subtitle: lines.slice(1).map(l => l.text).join(" · "), url: a ? a.href.split("?")[0] : "" };
+  }
+
+  // Featured cards lead with their kind ("Link", "Post", …), then the title.
+  function parseFeatured(entry) {
+    const lines = plain(entryLines(entry));
+    if (!lines.length) return null;
+    const KIND_RX = /^(link|post|article|document|image|video|newsletter|media|event|service)$/i;
+    const kind = KIND_RX.test(lines[0].text) ? lines.shift().text : "";
+    if (!lines.length) return null;
+    return {
+      type: kind, title: lines[0].text, description: lines.slice(1).map(l => l.text).join("\n"),
+      links: externalLinks(entry),
+    };
+  }
+
+  function parseGeneric(entry) {
+    const lines = entryLines(entry);
+    if (!lines.length) return null;
+    const p = plain(lines);
+    if (!p.length) return null;
+    return {
+      title: p[0].text, subtitle: p[1] ? p[1].text : "", details: p.slice(2).map(l => l.text),
+      ...extras(entry, lines),
+    };
+  }
+
+  // key, label, heading match, details-page slug, parser, how to title an entry
+  const SECTIONS = [
+    { key: "experience",      label: "Experience",                rx: /^experience$/i,                                          slug: "experience",               parse: parseExperience,     title: e => [e.title, e.company].filter(Boolean).join(" — ") },
+    { key: "education",       label: "Education",                 rx: /^education$/i,                                           slug: "education",                parse: parseEducation,      title: e => e.school },
+    { key: "certifications",  label: "Licenses & Certifications", rx: /^(licen[cs]es?\s*(&|and)\s*)?certifications?$/i,           slug: "certifications",           parse: parseCertification,  title: e => e.name },
+    { key: "projects",        label: "Projects",                  rx: /^projects$/i,                                            slug: "projects",                 parse: parseProject,        title: e => e.name },
+    { key: "volunteering",    label: "Volunteering",              rx: /^volunteer(ing|\s+experiences?)?$/i,                     slug: "volunteering-experiences", parse: parseVolunteering,   title: e => [e.role, e.organization].filter(Boolean).join(" — ") },
+    { key: "skills",          label: "Skills",                    rx: /^skills$/i,                                              slug: "skills",                   parse: parseSkill },
+    { key: "honors",          label: "Honors & Awards",           rx: /^(hono(u)?rs?\s*(&|and)\s*awards?|hono(u)?rs|awards)$/i,  slug: "honors",                   parse: parseHonor,          title: e => e.title },
+    { key: "courses",         label: "Courses",                   rx: /^courses$/i,                                             slug: "courses",                  parse: parseCourse,         title: e => e.name },
+    { key: "testScores",      label: "Test Scores",               rx: /^test scores$/i,                                         slug: "test-scores",              parse: parseTestScore,      title: e => e.name },
+    { key: "languages",       label: "Languages",                 rx: /^languages$/i,                                           slug: "languages",                parse: parseLanguage },
+    { key: "publications",    label: "Publications",              rx: /^publications$/i,                                        slug: "publications",             parse: parsePublication,    title: e => e.title },
+    { key: "patents",         label: "Patents",                   rx: /^patents$/i,                                             slug: "patents",                  parse: parsePatent,         title: e => e.title },
+    { key: "organizations",   label: "Organizations",             rx: /^organizations$/i,                                       slug: "organizations",            parse: parseOrganization,   title: e => e.name },
+    { key: "recommendations", label: "Recommendations",           rx: /^recommendations$/i,                                     slug: "recommendations",          parse: parseRecommendation, title: e => e.from, tabField: "direction" },
+    { key: "featured",        label: "Featured",                  rx: /^featured$/i,                                            slug: null,                       parse: parseFeatured,       title: e => [e.type, e.title].filter(Boolean).join(": "), entrySel: '[role="listitem"], li' },
+    { key: "interests",       label: "Interests",                 rx: /^interests$/i,                                           slug: "interests",                parse: parseInterest,       tabField: "category" },
+    { key: "causes",          label: "Causes",                    rx: /^causes$/i,                                              slug: null,                       text: true },
+  ];
+  const SECTION_BY_KEY = Object.fromEntries(SECTIONS.map(s => [s.key, s]));
+  const IGNORED_SECTIONS = /^(suggested for you|analytics|activity|people you may know|you might like|who your viewers also viewed|people also viewed|more profiles for you|explore premium profiles|profile language|public profile & url|connected apps|ad options|don.t want to see this|resources|pages for you|people you may know from .*)$/i;
+
+  // Placeholder cards ("You haven't written any recommendations yet").
+  const EMPTY_STATE_RX = /^(you haven.t|you have no|no \w+( \w+)? yet|nothing to (see|show)|.* will (appear|show) here)/i;
+
+  function parseEntries(cfg, container) {
+    return findEntries(container, cfg.entrySel).flatMap(e => {
+      const r = cfg.parse(e);
+      return (Array.isArray(r) ? r : r ? [r] : [])
+        .filter(x => !EMPTY_STATE_RX.test(String(Object.values(x).find(v => typeof v === "string" && v) || "")));
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // PROFILE PAGE: header, about, contact, section cards
+  // ─────────────────────────────────────────────────────────────
+  function topCard(d) {
+    const a = d.querySelector('main a[href*="/overlay/contact-info"]');
+    if (a && a.closest("section")) return a.closest("section");
+    return qa(d, "main section").find(s => s.querySelector("h1, h2")) || null;
+  }
+
+  function parseHeader(d) {
+    const h = { name: "", pronouns: "", headline: "", current: "", location: "", connections: "", followers: "", other: [] };
+    const card = topCard(d);
+    if (!card) return h;
+    const nameEl = card.querySelector("h1") || card.querySelector("h2");
+    if (nameEl) h.name = oneLine(extractLines([nameEl]).map(l => l.text).join(" "));
+    const contactA = card.querySelector('a[href*="/overlay/contact-info"]');
+    const lines = extractLines([card], el =>
+      el.localName === "a" && /\/(trust|premium|edit|overlay\/contact-info)\b/.test(el.getAttribute("href") || ""))
+      .filter(l => !(nameEl && nameEl.contains(l.node)) && l.text !== h.name);
+    const before = l => contactA && (l.node.compareDocumentPosition(contactA) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const locLine = contactA ? lines.filter(before).pop() : null;
+    if (locLine) h.location = locLine.text;
+    const seen = new Set([h.name, h.location]);
+    for (const l of lines) {
+      const t = l.text;
+      if (l === locLine || seen.has(t)) continue;
+      seen.add(t);
+      if (!h.pronouns && /^(he|she|they|xe|ze|it)\s*\/\s*\w+/i.test(t) && t.length < 30) { h.pronouns = t; continue; }
+      if (/^·?\s*(1st|2nd|3rd\+?)$/i.test(t)) continue;
+      if (/verif|premium|try .* for (free|\w+ 0)/i.test(t)) continue;
+      if (/\bconnections?\b/i.test(t) && t.length < 40) { h.connections = t; continue; }
+      if (/\bfollowers?\b/i.test(t) && t.length < 40) { h.followers = t; continue; }
+      if (!h.headline) { h.headline = t; continue; }
+      if (!h.current && / · /.test(t)) { h.current = t; continue; }
+      // Current-company / school chips repeat the "Company · School" line.
+      if (h.current && h.current.split(" · ").includes(t)) continue;
+      h.other.push(t);
+    }
+    return h;
+  }
+
+  function sectionTitle(sec) {
+    const h = sec.querySelector("h2");
+    const t = h ? oneLine(extractLines([h]).map(l => l.text).join(" ")) : "";
+    const m = t.match(/^(.*?)\s*\((\d[\d,]*)\)$/);
+    return m ? { title: m[1], count: +m[2].replace(/,/g, "") } : { title: t, count: 0 };
+  }
+
+  function profileSections(d) {
+    return qa(d, "main section").filter(s => {
+      const h = s.querySelector("h2");
+      return h && h.closest("section") === s && s !== topCard(d);
+    });
+  }
+
+  function parseAbout(sec) {
+    const lines = extractLines([sec], el => /^h[1-6]$/.test(el.localName));
+    const out = { about: "", topSkills: [] };
+    const i = lines.findIndex(l => /^top skills$/i.test(l.text));
+    const body = (i >= 0 ? lines.slice(0, i) : lines);
+    out.about = body.map(l => l.text).join("\n");
+    if (i >= 0 && lines[i + 1]) out.topSkills = lines[i + 1].text.split(/\s*•\s*/).filter(Boolean);
+    return out;
+  }
+
+  function detailsUrlFor(sec, cfg) {
+    const urls = qa(sec, 'a[href*="/details/"]')
+      .map(a => { try { return new URL(a.getAttribute("href"), location.href); } catch (_) { return null; } })
+      .filter(u => u && /\/details\/[^/]+\/?$/.test(u.pathname));
+    const u = urls.find(x => cfg.slug && x.pathname.includes(`/details/${cfg.slug}`)) || urls[0];
+    return u ? u.href : "";
+  }
+
+  function expectedCount(sec, headingCount) {
+    if (headingCount) return headingCount;
+    for (const a of qa(sec, "a")) {
+      const m = oneLine(a.textContent).match(/show all (\d[\d,]*)/i);
+      if (m) return +m[1].replace(/,/g, "");
+    }
+    return 0;
+  }
+
+  function parseContact(d) {
+    const h = qa(d, "dialog h1, dialog h2, [role=dialog] h1, [role=dialog] h2").find(x => /contact info/i.test(x.textContent));
+    if (!h) return null;
+    const dlg = h.closest('dialog, [role="dialog"]');
+    const root = dlg.querySelector('[data-testid="dialog-content"]') || dlg;
+    const LABELS = {
+      "your profile": "profileUrl", "profile": "profileUrl", "website": "websites", "websites": "websites",
+      "email": "email", "phone": "phone", "address": "address", "birthday": "birthday", "twitter": "twitter",
+      "x": "twitter", "im": "im", "instant messaging": "im", "wechat": "wechat", "connected": "connectedSince",
+    };
+    const STOP_RX = /premium|refine your profile|members can receive|free trial|edit contact info|millions of other members/i;
+    const out = {};
+    let key = null;
+    for (const l of extractLines([root], el => /^h[1-6]$/.test(el.localName))) {
+      const t = l.text;
+      const label = LABELS[t.toLowerCase()];
+      if (label) { key = label; continue; }
+      if (STOP_RX.test(t)) { key = null; continue; }
+      if (!key) continue;
+      const a = l.node.closest("a[href]");
+      let v = t;
+      if (key === "websites" && a) {
+        const url = decodeHref(a.getAttribute("href"));
+        const kind = (t.match(/\(([^)]+)\)\s*$/) || [])[1];
+        v = kind ? `${url} (${kind})` : url;
+      }
+      (out[key] = out[key] || []).push(v);
+    }
+    for (const k of Object.keys(out)) if (k !== "websites") out[k] = out[k].join(", ");
+    return out;
+  }
+
+  // Cross-reference the skills page ("Used in: Employee at SST Inc.") so
+  // entries whose skill line was cut off ("…, +2 skills") get the full list.
+  // Only entries with a unique name are filled in: two certificates both
+  // called "Certificate of Participation" can't be told apart.
+  const MORE_RX = /^\+(\d+) more$/;
+  function resolveSkillLinks(sections) {
+    const skills = sections.skills;
+    if (!skills || !skills.length) return;
+    const norm = s => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+    const usage = new Map();
+    for (const s of skills) for (const u of s.usedIn || []) {
+      const k = norm(u);
+      if (!usage.has(k)) usage.set(k, []);
+      if (!usage.get(k).includes(s.name)) usage.get(k).push(s.name);
+    }
+    const apply = (list, keyOf) => {
+      const seen = new Map();
+      for (const e of list || []) seen.set(norm(keyOf(e)), (seen.get(norm(keyOf(e))) || 0) + 1);
+      for (const e of list || []) {
+        const key = norm(keyOf(e));
+        const found = usage.get(key);
+        if (!found || seen.get(key) > 1) continue;
+        const shown = (e.skills || []).filter(x => !MORE_RX.test(x));
+        const more = +(((e.skills || []).find(x => MORE_RX.test(x)) || "").match(/\d+/) || [0])[0];
+        const merged = [...new Set([...shown, ...found])];
+        const missing = shown.length + more - merged.length;
+        e.skills = missing > 0 ? [...merged, `+${missing} more`] : merged;
+      }
+    };
+    apply(sections.experience, e => `${e.title} at ${e.company}`);
+    apply(sections.education, e => e.school);
+    apply(sections.certifications, e => e.name);
+    apply(sections.projects, e => e.name);
+    apply(sections.honors, e => e.title);
+    apply(sections.courses, e => e.name);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // OVERLAY + IFRAME LOADING
+  // ─────────────────────────────────────────────────────────────
+  const NOTE = "Keep this tab in front while it runs. LinkedIn only loads more entries while the page is visible.";
+
+  function el(doc, tag, props = {}, kids = []) {
+    const e = doc.createElement(tag);
+    for (const [k, v] of Object.entries(props)) {
+      if (k === "style") e.style.cssText = v;
+      else if (k === "text") e.textContent = v;
+      else e.setAttribute(k, v);
+    }
+    for (const k of kids) e.appendChild(k);
+    return e;
+  }
+
+  function createOverlay(onCancel) {
+    const host = el(document, "div", { "data-li-extractor": "", style: "all:initial;position:fixed;inset:0;z-index:2147483647;" });
+    const shadow = host.attachShadow({ mode: "open" });
+    const css = `
+      .backdrop{position:fixed;inset:0;background:rgba(5,8,15,.72)}
+      .panel{position:fixed;inset:3vh 3vw;display:flex;flex-direction:column;background:#0a0a0f;border:1px solid #1e1e2e;border-radius:12px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.5);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#e8e8f0}
+      .bar{display:flex;align-items:center;gap:14px;padding:12px 16px;border-bottom:1px solid #1e1e2e;background:linear-gradient(135deg,#0a1628,#0f1f3d)}
+      .logo{width:26px;height:26px;border-radius:6px;background:#0a84ff;color:#fff;font:700 10px/26px monospace;text-align:center;flex:none}
+      .info{flex:1;min-width:0}
+      .step{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .note{font-size:11px;color:#8e8ea8;margin-top:2px}
+      .track{height:4px;background:#1e1e2e;border-radius:2px;margin-top:8px;overflow:hidden}
+      .fill{height:100%;width:0;background:#0a84ff;transition:width .3s}
+      button{flex:none;background:transparent;color:#e8e8f0;border:1px solid #3a3a52;border-radius:6px;padding:6px 12px;font:inherit;cursor:pointer}
+      button:hover{background:#1e1e2e}
+      .frame{flex:1;position:relative;background:#fff}
+      iframe{position:absolute;inset:0;width:100%;height:100%;border:0;pointer-events:none}`;
+    const step = el(document, "div", { class: "step", text: "Starting…" });
+    const note = el(document, "div", { class: "note", text: NOTE });
+    const fill = el(document, "div", { class: "fill" });
+    const cancel = el(document, "button", { type: "button", text: "Cancel" });
+    const frameHost = el(document, "div", { class: "frame" });
+    shadow.append(
+      el(document, "style", { text: css }),
+      el(document, "div", { class: "backdrop" }),
+      el(document, "div", { class: "panel" }, [
+        el(document, "div", { class: "bar" }, [
+          el(document, "div", { class: "logo", text: "Li" }),
+          el(document, "div", { class: "info" }, [step, note, el(document, "div", { class: "track" }, [fill])]),
+          cancel,
+        ]),
+        frameHost,
+      ]),
+    );
+    cancel.addEventListener("click", () => { cancel.disabled = true; cancel.textContent = "Cancelling…"; onCancel(); });
+    (document.body || document.documentElement).appendChild(host);
+    return {
+      step(text, frac) {
+        step.textContent = text;
+        if (frac != null) fill.style.width = `${Math.round(Math.max(0, Math.min(1, frac)) * 100)}%`;
+      },
+      note(text) { note.textContent = text || NOTE; },
+      setFrame(f) { frameHost.replaceChildren(f); },
+      remove() { host.remove(); },
+    };
+  }
+
+  function checkCancel(ctx) { if (ctx.cancelled) throw new Error("Cancelled"); }
+
+  async function waitVisible(ctx) {
+    if (!document.hidden) return;
+    ctx.overlay.note("Paused: switch back to this tab to continue.");
+    while (document.hidden) { checkCancel(ctx); await sleep(400); }
+    ctx.overlay.note();
+  }
+
+  // Load `url` in a fresh iframe and resolve with its document once
+  // isReady(doc, elapsedMs) is true.
+  async function openPage(ctx, url, isReady, timeout = 30000) {
+    const frame = el(document, "iframe", { src: url, tabindex: "-1", "aria-hidden": "true" });
+    ctx.overlay.setFrame(frame);
+    const t0 = Date.now();
+    let doc = null;
+    while (Date.now() - t0 < timeout) {
+      checkCancel(ctx);
+      await waitVisible(ctx);
+      await sleep(300);
+      try { doc = frame.contentDocument; } catch (_) { doc = null; }
+      if (!doc || !doc.URL.startsWith(location.origin) || doc.readyState === "loading") continue;
+      const path = new URL(doc.URL).pathname;
+      if (/^\/(authwall|login|checkpoint|uas\/login)/.test(path)) throw new Error("LinkedIn asked you to sign in again.");
+      if (isReady(doc, Date.now() - t0)) { await sleep(500); return doc; }
+    }
+    if (doc && doc.URL.startsWith(location.origin)) return doc;
+    throw new Error("Page took too long to load");
+  }
+
+  function findScroller(d) {
+    const ok = e => {
+      if (!e) return false;
+      const s = d.defaultView.getComputedStyle(e);
+      return /(auto|scroll)/.test(s.overflowY) && e.scrollHeight > e.clientHeight + 4;
+    };
+    for (let e = d.querySelector("main"); e; e = e.parentElement) if (ok(e)) return e;
+    return d.scrollingElement || d.documentElement;
+  }
+
+  // Scroll `target` to the bottom (or centre) of the scroller's viewport
+  // without touching the outer page (scrollIntoView would).
+  function scrollToEl(scroller, target, where) {
+    const d = scroller.ownerDocument;
+    const view = scroller === d.scrollingElement || scroller === d.documentElement
+      ? { top: 0, bottom: d.defaultView.innerHeight }
+      : scroller.getBoundingClientRect();
+    const r = target.getBoundingClientRect();
+    scroller.scrollTop += where === "center"
+      ? r.top - view.top - (view.bottom - view.top) / 2
+      : r.bottom - view.bottom + 4;
+  }
+
+  function clickLoadMore(scope) {
+    let clicked = false;
+    for (const b of qa(scope, "button")) {
+      if (/^(load more|show more results|see more results|show more)$/i.test(oneLine(b.textContent)) && !b.disabled) {
+        b.click();
+        clicked = true;
+      }
+    }
+    return clicked;
+  }
+
+  // Keep nudging the end of the list into view (and clicking "Load more")
+  // until the list stops growing or reaches the count LinkedIn advertised.
+  async function loadAll(ctx, d, getContainer, { expected = 0, sel, onCount } = {}) {
+    const scroller = findScroller(d);
+    const sig = () => {
+      const c = getContainer();
+      return c ? `${findEntries(c, sel).length}|${(c.textContent || "").length}` : "";
+    };
+    let idle = 0;
+    for (let round = 0; round < 200; round++) {
+      checkCancel(ctx);
+      await waitVisible(ctx);
+      const c = getContainer();
+      if (!c) break;
+      const n = findEntries(c, sel).length;
+      if (onCount) onCount(n);
+      if (expected && n >= expected) break;
+      const before = sig();
+      const clicked = clickLoadMore(c.closest("section") || c);
+      scroller.scrollTop -= 300;
+      await sleep(60);
+      scrollToEl(scroller, c.lastElementChild || c, "end");
+      let changed = false;
+      for (let i = 0; i < 12 && !changed; i++) { await sleep(250); changed = sig() !== before; }
+      if (changed) { idle = 0; continue; }
+      // Short lists (< one page of 10) rarely have more; don't wait long.
+      if (++idle >= (clicked ? 2 : n < 8 && !expected ? 1 : 3)) break;
+    }
+    scroller.scrollTop = 0;
+  }
+
+  // Descriptions are already complete in the DOM (the "… more" button only
+  // lifts a CSS clamp), so this is belt and braces. Only buttons inside
+  // profile entries are clicked: the same button on an Activity post opens
+  // the post, navigating the frame away.
+  async function expandAll(scope) {
+    if (!scope) return;
+    const btns = qa(scope, 'button[data-testid="expandable-text-button"], button.inline-show-more-text__button')
+      .filter(b => b.closest(`${ENTRY_SEL}, ${LEGACY_ENTRY_SEL}`));
+    for (const b of btns) { try { b.click(); } catch (_) {} }
+    if (btns.length) await sleep(400);
+  }
+
+  function ensureOn(d, url) {
+    const want = new URL(url).pathname.replace(/\/$/, "");
+    if (!d.location.pathname.replace(/\/$/, "").startsWith(want)) {
+      throw new Error(`page navigated away to ${d.location.pathname}`);
+    }
+  }
+
+  // The profile lazy-renders section cards: some as empty skeletons, the
+  // rest (Skills onwards) in batches as a trigger near the end of the list
+  // scrolls into view. Jumping straight to the bottom skips past that
+  // trigger, so step down a screen at a time (centring any skeleton) until
+  // the bottom stops growing.
+  async function loadProfileSections(ctx, d) {
+    const scroller = findScroller(d);
+    const skeletons = () => qa(d, "main section").filter(s => !s.querySelector("h2") && !(s.textContent || "").trim());
+    const count = () => `${qa(d, "main h2").length}|${skeletons().length}`;
+    const atBottom = () => scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4;
+    let idle = 0;
+    for (let round = 0; round < 80 && idle < 2; round++) {
+      checkCancel(ctx);
+      await waitVisible(ctx);
+      const before = count();
+      const pending = skeletons();
+      if (pending.length) scrollToEl(scroller, pending[0], "center");
+      else scroller.scrollTop += Math.max(300, scroller.clientHeight * 0.85);
+      let changed = false;
+      const waits = atBottom() ? 10 : 2;
+      for (let i = 0; i < waits && !changed; i++) { await sleep(250); changed = count() !== before; }
+      if (changed) idle = 0;
+      else if (atBottom()) idle++;
+    }
+    scroller.scrollTop = 0;
+  }
+
+  const detailsList = d => {
+    const lists = qa(d, '[data-testid^="profile_"]').filter(x => x.querySelector(ENTRY_SEL));
+    if (lists.length) return lists.sort((a, b) => qa(b, ENTRY_SEL).length - qa(a, ENTRY_SEL).length)[0];
+    const prim = d.querySelector("main section");
+    if (!prim) return d.querySelector("main");
+    return prim.querySelector('[data-testid="lazy-column"]') || prim;
+  };
+  const detailsReady = (d, elapsed) =>
+    !!d.querySelector(`main ${ENTRY_SEL}, main [data-testid="lazy-column"] a, main [data-testid="lazy-column"] button, main ${LEGACY_ENTRY_SEL}`) ||
+    (elapsed > 7000 && !!d.querySelector("main section") && (d.querySelector("main section").textContent || "").trim().length > 20);
+
+  // Tabs on details pages: checkbox+label pairs (interests, recommendations)
+  // or role=tab.
+  function findTabs(scope) {
+    const labels = qa(scope, "label[for]").filter(l => {
+      const input = l.ownerDocument.getElementById(l.htmlFor);
+      return input && /^(checkbox|radio)$/.test(input.type);
+    });
+    if (labels.length >= 2) {
+      return labels.map(l => ({ name: oneLine(l.textContent), el: l, active: () => l.ownerDocument.getElementById(l.htmlFor).checked }));
+    }
+    return qa(scope, '[role="tab"]').map(t => ({ name: oneLine(t.textContent), el: t, active: () => t.getAttribute("aria-selected") === "true" }));
+  }
+
+  async function scrapeTabbed(ctx, d, cfg, url, report) {
+    const prim = d.querySelector("main section") || d.querySelector("main");
+    const tabs = findTabs(prim);
+    if (!tabs.length) {
+      await loadAll(ctx, d, () => detailsList(d));
+      await expandAll(detailsList(d));
+      ensureOn(d, url);
+      return parseEntries(cfg, detailsList(d));
+    }
+    const out = [];
+    for (const tab of tabs) {
+      checkCancel(ctx);
+      report(`${cfg.label}: ${tab.name}`);
+      if (!tab.active()) { tab.el.click(); await sleep(1800); }
+      await loadAll(ctx, d, () => detailsList(d));
+      await expandAll(detailsList(d));
+      ensureOn(d, url);
+      for (const e of parseEntries(cfg, detailsList(d))) out.push({ [cfg.tabField]: tab.name, ...e });
+    }
+    return out;
+  }
+
+  // Skills page filter buttons (All / Industry Knowledge / Tools & …):
+  // re-read the list under each one to learn every skill's category. The
+  // filtered views render skills in a lazy column rather than as
+  // entity-collection items, but every skill row in either view carries
+  // componentkey="com.linkedin.sdui.profile.skill(<profile>, <id>)". (The
+  // trailing ")" excludes "…skill(<profile>)-maxSkillsCallout".)
+  const SKILL_SEL = '[componentkey^="com.linkedin.sdui.profile.skill("][componentkey$=")"]';
+
+  async function tagSkillCategories(ctx, d, skills, report) {
+    const prim = () => d.querySelector("main section");
+    const current = prim() && prim().querySelector("button[aria-current]");
+    if (!current) return;
+    let group = current.parentElement;
+    while (group && group !== prim() && qa(group, "button").length < 2) group = group.parentElement;
+    const cats = qa(group, "button").map(b => oneLine(b.textContent)).filter(Boolean).slice(1);
+    const button = cat => qa(prim(), "button").find(b => oneLine(b.textContent) === cat);
+    const rows = () => topLevel(qa(prim(), SKILL_SEL));
+    const list = () => {
+      const r = rows()[0];
+      return (r && r.closest('[data-testid="lazy-column"], [data-testid^="profile_"]')) || prim();
+    };
+    const byName = new Map(skills.map(s => [s.name, s]));
+    for (const cat of cats) {
+      checkCancel(ctx);
+      const b = button(cat);
+      if (!b) continue;
+      report(`Skills: ${cat}`);
+      // Wait for the old list to be replaced before reading, or every skill
+      // still on screen would be tagged with this category.
+      const first = rows()[0];
+      b.click();
+      const t0 = Date.now();
+      while (Date.now() - t0 < 10000 && (!rows().length || rows()[0] === first)) {
+        checkCancel(ctx);
+        await sleep(200);
+      }
+      const active = button(cat);
+      if (!active || !active.hasAttribute("aria-current") || !rows().length || rows()[0] === first) continue;
+      await loadAll(ctx, d, list, { sel: SKILL_SEL });
+      for (const row of rows()) {
+        const s = parseSkill(row);
+        const hit = s && byName.get(s.name);
+        if (hit && !hit.category) hit.category = cat;
+      }
+    }
+  }
+
+  async function scrapeDetails(ctx, item, report) {
+    const { cfg, url, expected } = item;
+    const d = await openPage(ctx, url, detailsReady);
+    if (cfg.tabField) return scrapeTabbed(ctx, d, cfg, url, report);
+    await loadAll(ctx, d, () => detailsList(d), {
+      expected,
+      onCount: n => report(`${cfg.label}: ${n}${expected ? ` of ${expected}` : ""} loaded`),
+    });
+    await expandAll(detailsList(d));
+    ensureOn(d, url);
+    const entries = parseEntries(cfg, detailsList(d));
+    if (cfg.key === "skills" && entries.length) {
+      try { await tagSkillCategories(ctx, d, entries, report); } catch (e) { if (ctx.cancelled) throw e; }
     }
     return entries;
   }
 
-  function extractEducation(root) {
-    root = root || findSection("education");
-    if (!root) return [];
-    return getItems(root).map(item => {
-      const fields = itemFields(item);
-      let dur = "";
-      const rest = fields.filter(s => { if (!dur && (isDate(s) || YEAR_RX.test(s))) { dur = splitDateAndDuration(s).date; return false; } return true; });
-      return {
-        school: rest[0] || "", degree: rest[1] || "", field: rest[2] || "",
-        duration: dur, description: pickDescription(rest.slice(3)),
+  // ─────────────────────────────────────────────────────────────
+  // ORCHESTRATION
+  // ─────────────────────────────────────────────────────────────
+  function profileId(path = location.pathname) {
+    const m = path.match(/^\/in\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  async function extractAll(onProgress = () => {}) {
+    const id = profileId();
+    if (!id) throw new Error("Open a LinkedIn profile (linkedin.com/in/…) first.");
+    const base = `${location.origin}/in/${encodeURIComponent(id)}/`;
+    const ctx = { cancelled: false, warnings: [] };
+    ctx.overlay = createOverlay(() => { ctx.cancelled = true; });
+    let frac = 0;
+    const report = (text, f) => {
+      if (f != null) frac = f;
+      ctx.overlay.step(text, frac);
+      onProgress({ label: text, frac });
+    };
+    ctx.cancel = () => { ctx.cancelled = true; };
+    currentJob = ctx;
+
+    try {
+      // 1. Profile page
+      report("Loading profile…", 0.02);
+      const doc = await openPage(ctx, base, d => !!topCard(d));
+      report("Loading every section of the profile…", 0.05);
+      await loadProfileSections(ctx, doc);
+      ensureOn(doc, base);
+
+      const profile = {
+        meta: { extractedAt: new Date().toISOString(), profileUrl: base, extractor: `LinkedIn Profile Extractor ${VERSION}` },
+        header: parseHeader(doc),
+        contact: null,
+        about: "",
+        topSkills: [],
+        sections: {},
+        warnings: ctx.warnings,
       };
-    }).filter(e => e.school);
+      if (!profile.header.name) profile.header.name = doc.title.replace(/^\(\d+\)\s*/, "").replace(/\s*\|\s*LinkedIn.*$/i, "");
+
+      const plan = [];
+      for (const sec of profileSections(doc)) {
+        const { title, count } = sectionTitle(sec);
+        if (!title || IGNORED_SECTIONS.test(title)) continue;
+        if (/^about$/i.test(title)) { Object.assign(profile, parseAbout(sec)); continue; }
+        const cfg = SECTIONS.find(s => s.rx.test(title));
+        if (!cfg) {
+          // Unknown card with real entries — keep it under its own heading.
+          const entries = parseEntries({ parse: parseGeneric }, sec);
+          if (entries.length) profile.sections[title] = entries;
+          continue;
+        }
+        if (cfg.text) {
+          profile.sections[cfg.key] = extractLines([sec], x => /^h[1-6]$/.test(x.localName))
+            .flatMap(l => l.text.split(/\s*•\s*/)).filter(Boolean);
+          continue;
+        }
+        profile.sections[cfg.key] = parseEntries(cfg, sec);
+        const url = cfg.slug ? detailsUrlFor(sec, cfg) : "";
+        if (url) plan.push({ cfg, url, expected: expectedCount(sec, count) });
+      }
+
+      // 2. Every section's "Show all" page
+      for (let i = 0; i < plan.length; i++) {
+        const item = plan[i];
+        const f0 = 0.1 + (0.8 * i) / plan.length;
+        report(`${item.cfg.label} (${i + 1}/${plan.length})…`, f0);
+        try {
+          const entries = await scrapeDetails(ctx, item, t => report(`${t}  ·  section ${i + 1}/${plan.length}`));
+          // The details page is the full list; the profile preview is only a
+          // fallback for when it comes back empty.
+          if (entries.length) profile.sections[item.cfg.key] = entries;
+          else if ((profile.sections[item.cfg.key] || []).length) ctx.warnings.push(`${item.cfg.label}: the "Show all" page came back empty; kept the profile preview.`);
+          if (item.expected && entries.length < item.expected) {
+            ctx.warnings.push(`${item.cfg.label}: got ${entries.length} of ${item.expected} entries (LinkedIn stopped loading more).`);
+          }
+        } catch (e) {
+          if (ctx.cancelled) throw e;
+          ctx.warnings.push(`${item.cfg.label}: ${e.message}`);
+          log(item.cfg.label, e);
+        }
+      }
+
+      // 3. Contact info
+      report("Contact info…", 0.92);
+      try {
+        const d = await openPage(ctx, `${base}overlay/contact-info/`, (d, t) => !!parseContact(d) || t > 12000, 20000);
+        profile.contact = parseContact(d);
+      } catch (e) {
+        if (ctx.cancelled) throw e;
+        ctx.warnings.push(`Contact info: ${e.message}`);
+      }
+
+      resolveSkillLinks(profile.sections);
+      report("Done", 1);
+      return prune(profile);
+    } finally {
+      ctx.overlay.remove();
+      currentJob = null;
+    }
   }
 
-  function extractSkills(root) {
-    root = root || findSection("skills");
-    if (!root) return [];
-    const seen = new Set();
-    return getItems(root).flatMap(item => {
-      const fields = itemFields(item);
-      const name = fields[0] || "";
-      if (!name || seen.has(name)) return []; seen.add(name);
-      const rest = fields.slice(1);
-      return [{
-        name,
-        category:   rest.find(s => !/endorsement|people/i.test(s) && s.length < 60) || "",
-        endorsements: rest.find(s => /endorsement|people/i.test(s)) || "",
-      }];
-    });
+  function prune(v) {
+    if (Array.isArray(v)) return v.map(prune).filter(x => !isEmpty(x));
+    if (v && typeof v === "object") {
+      const o = {};
+      for (const [k, x] of Object.entries(v)) {
+        const p = prune(x);
+        if (!isEmpty(p) || k === "warnings") o[k] = p;
+      }
+      return o;
+    }
+    return typeof v === "string" ? v.trim() : v;
+  }
+  function isEmpty(x) {
+    return x == null || x === "" || (Array.isArray(x) && !x.length) || (typeof x === "object" && !Array.isArray(x) && !Object.keys(x).length);
   }
 
-  // Split a combined "Issued by <Issuer> · <Month Year>" field into parts.
-  // Real example from debug: "Issued by PerseCoding · Feb 2026"
-  function splitIssuedField(s) {
-    const out = { issuer: "", issued: "" };
-    if (!s) return out;
-    const parts = clean(s).split(/\s*·\s*/);
-    for (const p of parts) {
-      if (!out.issued && (MONTH_YEAR_RX.test(p) || /^\d{4}$/.test(p))) out.issued = p;
-      else if (/issued\s+by/i.test(p)) out.issuer = clean(p.replace(/^issued\s+by/i, ""));
-      else if (out.issuer && MONTH_YEAR_RX.test(p) && !out.issued) out.issued = p;
+  // ─────────────────────────────────────────────────────────────
+  // TEXT OUTPUT
+  // ─────────────────────────────────────────────────────────────
+  const LABELS = {
+    employmentType: "Employment type", totalTenure: "Total at company", companyUrl: "Company page",
+    schoolUrl: "School page", credentialId: "Credential ID", credentialUrl: "Credential URL",
+    associatedWith: "Associated with", usedIn: "Used in", details: "Other", url: "URL",
+    profileUrl: "Profile URL", connectedSince: "Connected", im: "IM",
+  };
+  const labelOf = k => LABELS[k] || k.replace(/([A-Z])/g, " $1").replace(/^./, c => c.toUpperCase());
+
+  function formatText(p) {
+    const L = [];
+    const DIV = "═".repeat(64), THIN = "─".repeat(56);
+    const H = t => L.push("", DIV, `  ${t.toUpperCase()}`, DIV);
+    const block = (text, ind) => { for (const ln of String(text).split("\n")) L.push(ln.trim() ? ind + ln : ""); };
+    const field = (k, v, ind) => {
+      if (isEmpty(v)) return;
+      if (Array.isArray(v)) {
+        if (v.every(x => typeof x === "string")) {
+          if (["skills", "topSkills"].includes(k)) { L.push(`${ind}${labelOf(k)}: ${v.join(", ")}`); return; }
+          L.push(`${ind}${labelOf(k)}:`);
+          v.forEach(x => block(`• ${x}`, ind + "  "));
+        } else {
+          L.push(`${ind}${labelOf(k)}:`);
+          v.forEach(m => { block(`• ${m.title}`, ind + "  "); if (m.description) block(m.description, ind + "    "); });
+        }
+        return;
+      }
+      const s = String(v);
+      if (s.includes("\n") || s.length > 110) { L.push(`${ind}${labelOf(k)}:`); block(s, ind + "  "); }
+      else L.push(`${ind}${labelOf(k)}: ${s}`);
+    };
+
+    L.push(DIV, "  LINKEDIN PROFILE EXTRACT",
+      `  Name      : ${p.header?.name || ""}`,
+      `  Profile   : ${p.meta.profileUrl}`,
+      `  Extracted : ${new Date(p.meta.extractedAt).toLocaleString()}`, DIV);
+
+    H("Personal Information");
+    for (const [k, v] of Object.entries(p.header || {})) field(k, v, "  ");
+    if (p.contact) { H("Contact Info"); for (const [k, v] of Object.entries(p.contact)) field(k, v, "  "); }
+    if (p.about || p.topSkills) {
+      H("About");
+      if (p.about) block(p.about, "  ");
+      if (p.topSkills) { L.push(""); field("topSkills", p.topSkills, "  "); }
     }
-    // Fallback: whole string minus "Issued by" prefix as issuer if no date matched
-    if (!out.issuer && !out.issued && /issued\s+by/i.test(s)) {
-      out.issuer = clean(s.replace(/^.*?issued\s+by/i, "").split(/\s*·\s*/)[0]);
+
+    const sections = p.sections || {};
+    const keys = [...SECTIONS.map(s => s.key).filter(k => sections[k]), ...Object.keys(sections).filter(k => !SECTION_BY_KEY[k])];
+    for (const key of keys) {
+      const cfg = SECTION_BY_KEY[key] || { label: key };
+      const data = sections[key];
+      H(`${cfg.label} (${data.length})`);
+      if (cfg.text) { data.forEach(t => block(`• ${t}`, "  ")); continue; }
+      if (key === "skills") {
+        for (const s of data) {
+          L.push(`  • ${s.name}${s.category ? `  [${s.category}]` : ""}`);
+          for (const k of ["usedIn", "endorsements", "details"]) if (s[k]) L.push(`      ${labelOf(k)}: ${s[k].join("; ")}`);
+        }
+        continue;
+      }
+      if (key === "languages") {
+        data.forEach(e => L.push(`  • ${e.language}${e.proficiency ? ` — ${e.proficiency}` : ""}`));
+        continue;
+      }
+      if (key === "interests") {
+        let last = null;
+        for (const e of data) {
+          if (e.category !== last) { L.push("", `  ${e.category || "Other"}:`); last = e.category; }
+          L.push(`    • ${e.name}${e.subtitle ? ` — ${e.subtitle}` : ""}`);
+        }
+        continue;
+      }
+      data.forEach((e, i) => {
+        const title = (cfg.title && cfg.title(e)) || Object.values(e).find(v => typeof v === "string") || `Entry ${i + 1}`;
+        L.push("", `  ▸ ${i + 1}. ${title}`, `  ${THIN}`);
+        for (const [k, v] of Object.entries(e)) field(k, v, "    ");
+      });
     }
+
+    if (p.warnings && p.warnings.length) {
+      H("Notes");
+      p.warnings.forEach(w => block(`• ${w}`, "  "));
+    }
+    L.push("", DIV, "  END OF PROFILE EXTRACT", DIV, "");
+    return L.join("\n");
+  }
+
+  function fileBase(name) {
+    const slug = String(name || "linkedin-profile").normalize("NFKD").replace(/[̀-ͯ]/g, "")
+      .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "linkedin-profile";
+    return `${slug}_${new Date().toISOString().slice(0, 10)}`;
+  }
+
+  function counts(p) {
+    const out = {};
+    for (const [k, v] of Object.entries(p.sections || {})) out[k] = Array.isArray(v) ? v.length : 0;
     return out;
   }
-  const MONTH_YEAR_RX = /^([A-Z][a-z]{2,8}\.?\s+\d{4}|\d{4})$/;
-
-  function extractCertifications(root) {
-    root = root || findSection("certifications");
-    if (!root) return [];
-    const seen = new Set();
-    return getItems(root).map(item => {
-      const fields = itemFields(item);
-      let issued = "", expiry = "", credentialId = "", issuer = "";
-      const rest = fields.filter(s => {
-        // Combined "Issued by X · Date" — split it.
-        if (ISSUED_RX.test(s) && !issued) {
-          if (/issued\s+by/i.test(s)) {
-            const sp = splitIssuedField(s);
-            issuer = sp.issuer; issued = sp.issued;
-          } else {
-            issued = s;
-          }
-          return false;
-        }
-        if (EXPIRY_RX.test(s) && !expiry)         { expiry = s; return false; }
-        if (CRED_RX.test(s) && !credentialId)     { credentialId = s.replace(/credential\s*id[:\s]*/i, "").trim(); return false; }
-        if (/^(show|see|view)\s/i.test(s) && s.length < 30) return false;
-        return true;
-      });
-      const url = externalUrl(item);
-      const name = rest[0] || "";
-      // issuer may already be set from the combined field; otherwise rest[1].
-      const finalIssuer = issuer || rest[1] || "";
-      // Description = longest remaining non-name, non-issuer line.
-      const desc = rest.slice(finalIssuer && rest[1] === finalIssuer ? 2 : 1)
-        .find(s => s.length >= 30 && !/^associated with/i.test(s)) || "";
-      return { name, issuer: finalIssuer, issued, expiry, credentialId, url, description: desc };
-    }).filter(e => {
-      if (!e.name || seen.has(e.name)) return false;
-      seen.add(e.name); return true;
-    });
-  }
-
-  function extractProjects(root) {
-    root = root || findSection("projects");
-    if (!root) return [];
-    return getItems(root).map(item => {
-      const fields = itemFields(item);
-      let dur = "";
-      const rest = fields.filter(s => { if (!dur && (isDate(s) || isDur(s))) { dur = splitDateAndDuration(s).date; return false; } return true; });
-      return { name: rest[0] || "", association: rest[1] || "", duration: dur, description: pickDescription(rest.slice(2), 40), url: externalUrl(item) };
-    }).filter(e => e.name);
-  }
-
-  function extractVolunteering(root) {
-    root = root || findSection("volunteering");
-    if (!root) return [];
-    return getItems(root).map(item => {
-      const fields = itemFields(item);
-      let dur = "", cause = "";
-      const rest = fields.filter(s => {
-        if (!dur && (isDate(s) || isDur(s))) { dur = splitDateAndDuration(s).date; return false; }
-        if (!cause && /cause|social/i.test(s)) { cause = s; return false; }
-        return true;
-      });
-      return { role: rest[0] || "", organization: rest[1] || "", duration: dur, cause, description: pickDescription(rest.slice(2), 40) };
-    }).filter(e => e.role);
-  }
-
-  function extractLanguages(root) {
-    root = root || findSection("languages");
-    if (!root) return [];
-    return getItems(root).map(item => {
-      const f = itemFields(item);
-      return { language: f[0] || "", proficiency: f[1] || "" };
-    }).filter(e => e.language);
-  }
-
-  function extractHonors(root) {
-    root = root || findSection("honors");
-    if (!root) return [];
-    const seen = new Set();
-    return getItems(root).map(item => {
-      const f = itemFields(item);
-      let issuer = "", date = "";
-      // LinkedIn collapses issuer+date into one "Issued by X · Date" line for
-      // honors just as it does for certs. Split it before positional parse.
-      const rest = f.filter(s => {
-        if (!issuer && /issued\s+by/i.test(s)) {
-          const sp = splitIssuedField(s);
-          issuer = sp.issuer; date = date || sp.issued;
-          return false;
-        }
-        if (!date && (MONTH_YEAR_RX.test(s) || isDate(s) || /^\d{4}$/.test(s))) {
-          date = s; return false;
-        }
-        return true;
-      });
-      const title = rest[0] || "";
-      // If issuer wasn't in an "Issued by" line, rest[1] is it.
-      const finalIssuer = issuer || rest[1] || "";
-      const desc = rest.slice(finalIssuer && rest[1] === finalIssuer ? 2 : 1)
-        .find(s => s.length >= 30 && !/^associated with/i.test(s)) || "";
-      const e = { title, issuer: finalIssuer, date, description: desc };
-      if (!e.title || seen.has(e.title)) return null;
-      seen.add(e.title); return e;
-    }).filter(Boolean);
-  }
-
-  function extractPublications(root) {
-    root = root || findSection("publications");
-    if (!root) return [];
-    return getItems(root).map(item => {
-      const f = itemFields(item);
-      return { title: f[0] || "", publisher: f[1] || "", date: f[2] || "", description: pickDescription(f.slice(3), 40), url: externalUrl(item) };
-    }).filter(e => e.title);
-  }
-
-  function extractCourses(root) {
-    root = root || findSection("courses");
-    if (!root) return [];
-    return getItems(root).map(item => {
-      const f = itemFields(item);
-      return { name: f[0] || "", number: f[1] || "" };
-    }).filter(e => e.name);
-  }
-
-  function extractRecommendations(root) {
-    root = root || findSection("recommendations");
-    if (!root) return [];
-    // Recommendations are tabbed (Received/Given). Merge all tabpanels.
-    const items = getTabbedItems(root) || getItems(root);
-    return items.map(item => {
-      const f = itemFields(item);
-      return { from: f[0] || "", role: f[1] || "", text: pickDescription(f.slice(2), 60) };
-    }).filter(e => e.from || e.text);
-  }
-
-  function extractOrganizations(root) {
-    root = root || findSection("organizations");
-    if (!root) return [];
-    return getItems(root).map(item => {
-      const f = itemFields(item);
-      return { name: f[0] || "", role: f[1] || "", duration: f[2] || "", description: pickDescription(f.slice(3), 40) };
-    }).filter(e => e.name);
-  }
-
-  function extractPatents(root) {
-    root = root || findSection("patents");
-    if (!root) return [];
-    return getItems(root).map(item => {
-      const f = itemFields(item);
-      return { title: f[0] || "", status: f[1] || "", number: f[2] || "", date: f[3] || "", description: pickDescription(f.slice(4), 40) };
-    }).filter(e => e.title);
-  }
 
   // ─────────────────────────────────────────────────────────────
-  // FORMATTERS
+  // JOB + MESSAGING
   // ─────────────────────────────────────────────────────────────
-  const DIV  = "═".repeat(60);
-  const THIN = "─".repeat(50);
-  const H    = t => ["", DIV, `  ${t.toUpperCase()}`, DIV].join("\n");
-  const SH   = t => ["", `  ▸ ${t}`, `  ${THIN}`].join("\n");
-  const FLD  = (l, v) => (v && v.toString().trim()) ? `  ${l}: ${v}` : null;
+  let currentJob = null;
+  let lastProgress = null;
 
-  function formatMain(profile) {
-    const lines = [];
-    const f = (l, v) => { const r = FLD(l, v); if (r) lines.push(r); };
-    lines.push(DIV,"  LINKEDIN PROFILE EXTRACT",
-      `  Extracted : ${new Date().toLocaleString()}`,
-      `  Source    : ${window.location.href}`,
-      `  Mode      : Full Profile`, DIV, H("Personal Information"));
-    f("Name",profile.header.name); f("Headline",profile.header.headline);
-    f("Location",profile.header.location); f("Connections",profile.header.connections);
-    if (profile.about) { lines.push(H("About"), `  ${profile.about}`); }
-    const SECS = [
-      ["experience",     "Experience",               (e,i)=>{ lines.push(SH(`Role ${i+1}`));     f("Title",e.title);f("Company",e.company);f("Duration",e.duration);f("Location",e.location);f("Description",e.description); }],
-      ["education",      "Education",                (e,i)=>{ lines.push(SH(`Entry ${i+1}`));    f("School",e.school);f("Degree",e.degree);f("Field",e.field);f("Duration",e.duration);f("Description",e.description); }],
-      ["skills",         "Skills",                   (e)=>  { const x=[e.category,e.endorsements].filter(Boolean).join(" · "); lines.push(`  • ${e.name}${x?`  [${x}]`:""}`); }],
-      ["certifications", "Licenses & Certifications",(e,i)=>{ lines.push(SH(`Cert ${i+1}`));    f("Name",e.name);f("Issuer",e.issuer);f("Issued",e.issued);f("Expires",e.expiry);f("Credential ID",e.credentialId);f("URL",e.url); }],
-      ["projects",       "Projects",                 (e,i)=>{ lines.push(SH(`Project ${i+1}`)); f("Name",e.name);f("Association",e.association);f("Duration",e.duration);f("Description",e.description);f("URL",e.url); }],
-      ["volunteering",   "Volunteer Experience",     (e,i)=>{ lines.push(SH(`Entry ${i+1}`));    f("Role",e.role);f("Organization",e.organization);f("Duration",e.duration);f("Cause",e.cause);f("Description",e.description); }],
-      ["languages",      "Languages",                (e)=>  { lines.push(`  • ${e.language}${e.proficiency?` — ${e.proficiency}`:""}`); }],
-      ["honors",         "Honors & Awards",          (e,i)=>{ lines.push(SH(`Award ${i+1}`));    f("Title",e.title);f("Issuer",e.issuer);f("Date",e.date);f("Description",e.description); }],
-      ["publications",   "Publications",             (e,i)=>{ lines.push(SH(`Pub ${i+1}`));      f("Title",e.title);f("Publisher",e.publisher);f("Date",e.date);f("Description",e.description);f("URL",e.url); }],
-      ["courses",        "Courses",                  (e)=>  { lines.push(`  • ${e.name}${e.number?` [${e.number}]`:""}`); }],
-      ["recommendations","Recommendations",          (e,i)=>{ lines.push(SH(`Rec ${i+1}`));      f("From",e.from);f("Their Role",e.role); if(e.text){lines.push(`  Text:`);lines.push(`    "${e.text}"`);} }],
-    ];
-    for (const [key,label,renderer] of SECS) {
-      const data = profile[key]; if (!data?.length) continue;
-      lines.push(H(`${label} (${data.length})`)); data.forEach(renderer);
-    }
-    lines.push("",DIV,"  END OF PROFILE EXTRACT",DIV,"");
-    return lines.filter(l=>l!==null).join("\n");
-  }
+  const notify = msg => { if (hasExt) chrome.runtime.sendMessage(msg).catch(() => {}); };
 
-  function formatDetail(sectionName, data, profileName) {
-    const lines = [
-      DIV, `  LINKEDIN — ${sectionName.toUpperCase()}`,
-      profileName ? `  Profile   : ${profileName}` : null,
-      `  Extracted : ${new Date().toLocaleString()}`,
-      `  Source    : ${window.location.href}`,
-      `  Entries   : ${data.length}`, DIV,
-    ];
-    if (!data.length) {
-      lines.push("","  No entries found. Scroll the full page first, then try again.","");
-    } else {
-      data.forEach((entry, i) => {
-        lines.push(SH(`Entry ${i + 1}`));
-        for (const [key, val] of Object.entries(entry)) {
-          if (!val || !val.toString().trim()) continue;
-          const label = key.replace(/([A-Z])/g," $1").replace(/^./,c=>c.toUpperCase());
-          if (key==="text") { lines.push(`  ${label}:`); lines.push(`    "${val}"`); }
-          else lines.push(`  ${label}: ${val}`);
-        }
-      });
-    }
-    lines.push("",DIV,`  END — ${data.length} ENTRIES EXTRACTED`,DIV,"");
-    return lines.filter(l=>l!==null).join("\n");
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // ORCHESTRATION with scroll + retry
-  // ─────────────────────────────────────────────────────────────
-  function runExtractMain() {
-    const profile = {
-      header:extractHeader(), about:extractAbout(),
-      experience:extractExperience(), education:extractEducation(),
-      skills:extractSkills(), certifications:extractCertifications(),
-      projects:extractProjects(), volunteering:extractVolunteering(),
-      languages:extractLanguages(), honors:extractHonors(),
-      publications:extractPublications(), courses:extractCourses(),
-      recommendations:extractRecommendations(),
-    };
-    return { mode:"main", profile, formatted:formatMain(profile) };
-  }
-
-  function runExtractDetail(section) {
-    const root = getDetailRoot();
-    const profileName = firstText(document, ".profile-detail__header-link", '[role="main"] h1', "h1");
-    const MAP = {
-      certifications:  ()=>extractCertifications(root),
-      experience:      ()=>extractExperience(root),
-      education:       ()=>extractEducation(root),
-      skills:          ()=>extractSkills(root),
-      projects:        ()=>extractProjects(root),
-      volunteering:    ()=>extractVolunteering(root),
-      languages:       ()=>extractLanguages(root),
-      honors:          ()=>extractHonors(root),
-      publications:    ()=>extractPublications(root),
-      courses:         ()=>extractCourses(root),
-      recommendations: ()=>extractRecommendations(root),
-      organizations:   ()=>extractOrganizations(root),
-      patents:         ()=>extractPatents(root),
-    };
-    const data  = (MAP[section]??(() => []))();
-    const label = section.charAt(0).toUpperCase()+section.slice(1);
-    return { mode:"detail", section, data, count:data.length, formatted:formatDetail(label,data,profileName) };
-  }
-
-  // Scroll progressively to the bottom so LinkedIn's lazy loader renders.
-  async function scrollToBottom() {
+  async function runJob() {
+    lastProgress = { label: "Starting…", frac: 0 };
     try {
-      const main = q(document, '[role="main"]') || document.body;
-      let last = -1, stable = 0;
-      for (let i = 0; i < 12 && stable < 2; i++) {
-        const before = main.scrollHeight;
-        window.scrollTo(0, main.scrollHeight);
-        await sleep(450);
-        const after = main.scrollHeight;
-        if (after === last) stable++; else stable = 0;
-        last = after;
-      }
-      window.scrollTo(0, 0);
-    } catch (_) {}
-  }
-
-  // Click any "See more" / "Show more" expand buttons inside a scope.
-  async function expandSeeMore(scope) {
-    try {
-      const root = scope || document;
-      const btns = qa(root, 'button[aria-label*="see more" i], button[aria-label*="show more" i]');
-      for (const b of btns) {
-        if (isVisuallyHidden(b)) continue;
-        try { b.click(); } catch (_) {}
-        await sleep(80);
-      }
-    } catch (_) {}
-  }
-
-  async function extractWithRetry(mode, section) {
-    const MAX = 3, DELAY = 800;
-    let result;
-    for (let i = 0; i < MAX; i++) {
-      if (i > 0) {
-        console.log(`[Li Extractor v8.3] Retry ${i}/${MAX-1} — scrolling + waiting ${DELAY}ms`);
-        await scrollToBottom();
-        await expandSeeMore(document);
-        await sleep(DELAY);
-      }
-      result = mode === "main" ? runExtractMain() : runExtractDetail(section);
-      const hasData = mode === "main"
-        ? Object.entries(result.profile).some(([k,v]) => k !== "header" && (Array.isArray(v) ? v.length > 0 : !!v))
-        : result.count > 0;
-      if (hasData) break;
+      const profile = await extractAll(p => { lastProgress = p; notify({ type: "li-progress", ...p }); });
+      const record = {
+        name: profile.header?.name || "",
+        url: profile.meta.profileUrl,
+        extractedAt: profile.meta.extractedAt,
+        fileBase: fileBase(profile.header?.name),
+        counts: counts(profile),
+        warnings: profile.warnings || [],
+        txt: formatText(profile),
+        json: JSON.stringify(profile, null, 2),
+      };
+      await chrome.storage.local.set({ lastExtract: record });
+      notify({ type: "li-done", name: record.name, counts: record.counts });
+      notify({ action: "download", format: "txt" });
+      log("Done", record.counts);
+    } catch (e) {
+      log("Failed:", e);
+      notify({ type: "li-error", error: e.message || String(e) });
+    } finally {
+      lastProgress = null;
     }
-    return result;
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // DEBUG
-  // ─────────────────────────────────────────────────────────────
-  window.__liDebug = function () {
-    const main  = q(document,'[role="main"]') || document.body;
-    const mode  = detectMode();
-    const root  = mode.mode === "detail" ? getDetailRoot() : (findSection("experience") || findSection("certifications") || main);
-    const { items, via } = getItemsDebug(root);
-
-    console.group("[Li Extractor v8.3] Debug");
-    console.log("URL:", window.location.href);
-    console.log("Mode:", mode);
-
-    console.log("Named regions:");
-    qa(main,'section,[role="region"],[aria-label],[aria-labelledby]').forEach((el,i) => {
-      const name = accessibleName(el);
-      if (name && ["SECTION","DIV","MAIN"].includes(el.tagName)) {
-        console.log(`  [${i}] ${el.tagName} name="${name}" | items=${qa(el,'[role="listitem"],li').length}`);
-      }
-    });
-
-    console.log("All lists:");
-    qa(main,'[role="list"],ul').forEach((l,i) => {
-      console.log(`  [${i}] score=${listScore(l)} items=${l.querySelectorAll('[role="listitem"],li').length} tag=${l.tagName} | "${(l.innerText||"").slice(0,60).replace(/\n/g," ")}"`);
-    });
-
-    console.log("role=listitem in main:", qa(main,'[role="listitem"]').length);
-    console.log("Chosen root:", root);
-    console.log("Root score:", listScore(root), "| isListEl:", isListEl(root));
-    console.log(`getItems() → ${items.length} items  (via strategy: ${via})`);
-
-    if (items.length === 0) {
-      // Diagnostics for the 0-items case: which markers ARE present in root?
-      const DRILL_RX = /\/(overlay|edit\/forms)\//;
-      const drillAnchors = qa(root, 'a[href]').filter(a => DRILL_RX.test(a.getAttribute("href") || ""));
-      console.log("── 0-items diagnostics ──");
-      console.log(`   role=listitem in root: ${qa(root,'[role="listitem"]').length}`);
-      console.log(`   <li> in root:          ${qa(root,'li').length}`);
-      console.log(`   [role=list] in root:   ${qa(root,'[role="list"]').length}`);
-      console.log(`   <ul> in root:          ${qa(root,'ul').length}`);
-      console.log(`   pvs paged-list-item:   ${qa(root,'.pvs-list__paged-list-item').length}`);
-      console.log(`   drill-down anchors:    ${drillAnchors.length}`, drillAnchors.slice(0,5).map(a=>a.getAttribute("href")));
-      console.log(`   root innerText(400):   "${(root.innerText||"").slice(0,400).replace(/\n/g," | ")}"`);
-    }
-
-    items.slice(0,3).forEach((item,i) => {
-      console.log(`── Item[${i}] role="${item.getAttribute('role')}" tag=${item.tagName}`);
-      console.log(`   itemFields():`, itemFields(item));
-      console.log(`   itemHeader():`, itemHeader(item));
-      console.log(`   anchors:`, qa(item,"a[href]").map(a=>a.href));
-      console.log(`   externalUrl:`, externalUrl(item));
-    });
-
-    console.groupEnd();
-  };
-
-  // ─────────────────────────────────────────────────────────────
-  // MESSAGE HANDLER
-  // ─────────────────────────────────────────────────────────────
   window.__liExtractHandler = function (request, _sender, sendResponse) {
-    if (request.action === "detectMode") {
-      sendResponse({ success:true, data:detectMode() });
-      return true;
+    if (request.action === "status") {
+      sendResponse({ success: true, data: { profileId: profileId(), running: !!currentJob, progress: lastProgress } });
+      return;
     }
-    if (request.action === "debug") {
-      window.__liDebug();
-      sendResponse({ success:true, data:{ message:"Check DevTools on the LinkedIn tab." } });
-      return true;
+    if (request.action === "extractAll") {
+      if (!profileId()) { sendResponse({ success: false, error: "Open a LinkedIn profile (linkedin.com/in/…) first." }); return; }
+      if (currentJob) { sendResponse({ success: true, data: { started: false, running: true } }); return; }
+      runJob();
+      sendResponse({ success: true, data: { started: true } });
+      return;
     }
-    if (request.action === "extract") {
-      const { mode, section } = detectMode();
-      if (mode === "unknown") {
-        sendResponse({ success:false, error:"Not on a LinkedIn profile or detail page." });
-        return true;
-      }
-      extractWithRetry(mode, section)
-        .then(result => sendResponse({ success:true, data:result }))
-        .catch(err => {
-          console.error("[LinkedIn Extractor v8.3]", err);
-          sendResponse({ success:false, error:err.message });
-        });
-      return true;
+    if (request.action === "cancel") {
+      if (currentJob) currentJob.cancel();
+      sendResponse({ success: true });
     }
   };
 
-  chrome.runtime.onMessage.addListener(window.__liExtractHandler);
-  console.log("[LinkedIn Extractor v8.3] Ready —", window.location.pathname);
+  // Console hook for debugging from the content-script context.
+  window.__liExtractor = { extractAll, formatText, parseHeader, parseEntries, SECTIONS, VERSION };
 
+  if (hasExt) chrome.runtime.onMessage.addListener(window.__liExtractHandler);
+  log(`v${VERSION} ready —`, location.pathname);
 })();

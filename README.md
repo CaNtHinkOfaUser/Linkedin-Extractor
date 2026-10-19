@@ -1,56 +1,37 @@
 # LinkedIn Profile Extractor — Chrome Extension
 
-Extract any LinkedIn profile into a clean, structured `.txt` file with one click.
+Extract an entire LinkedIn profile, every section and every entry, into a clean `.txt` file (and `.json`) with one click.
 
 ---
 
 ## What It Extracts
 
-| Section              | Fields captured                                      |
-|----------------------|------------------------------------------------------|
-| Personal Info        | Name, Headline, Location, Connections                |
-| About                | Full summary text                                    |
-| Experience           | Title, Company, Duration, Location, Description     |
-| Education            | School, Degree, Field, Duration, Description         |
-| Skills               | Skill name, Endorsement count                        |
-| Certifications       | Name, Issuer, Issue date, Credential ID, URL         |
-| Projects             | Name, Duration, Description, URL                    |
-| Volunteer Experience | Role, Organization, Duration, Cause, Description    |
-| Languages            | Language, Proficiency level                          |
-| Honors & Awards      | Title, Issuer, Date, Description                     |
-| Publications         | Title, Publisher, Date, Description                  |
-| Courses              | Name, Course number                                  |
-| Recommendations      | From, Their role, Full recommendation text           |
+The profile page only previews each section ("Show all 97 skills →"), so the extractor also opens every section's **Show all** page and reads the complete list.
 
----
+| Section              | Fields captured                                                                 |
+|----------------------|---------------------------------------------------------------------------------|
+| Personal Info        | Name, Pronouns, Headline, Current company/school, Location, Connections, Followers |
+| Contact Info         | Profile URL, Websites, Email, Phone, Birthday, …                                |
+| About                | Full summary text (line breaks kept), Top skills                                |
+| Experience           | Title, Company, Employment type, Dates, Duration, Location, Workplace, Description, Skills, Media |
+| Education            | School, Degree, Field, Dates, Grade, Activities, Description, Skills            |
+| Skills               | **Every** skill, its category (Industry Knowledge, Tools & Technologies, …), where it's used, endorsements |
+| Certifications       | Name, Issuer, Issued, Expires, Credential ID, Credential URL, Skills, Media     |
+| Projects             | Name, Dates, Associated with, Description, URL, Skills, Media                   |
+| Volunteering         | Role, Organization, Dates, Cause, Description, Media                            |
+| Honors & Awards      | Title, Issuer, Date, Associated with, Description, Media                        |
+| Courses              | Name, Number, Associated with                                                   |
+| Test Scores          | Name, Score, Date, Associated with, Description                                 |
+| Languages            | Language, Proficiency                                                           |
+| Publications         | Title, Publisher, Date, Description, URL                                        |
+| Patents              | Title, Number, Date, Description, URL                                           |
+| Organizations        | Name, Position, Dates, Description                                              |
+| Recommendations      | Received and Given: From, Headline, Date, Relationship, Full text               |
+| Featured             | Type, Title, Description, Links                                                 |
+| Interests            | Companies, Groups, Schools, … with follower counts                              |
+| Causes               | Each cause                                                                      |
 
-## Sample Output
-
-```
-════════════════════════════════════════════════════════════
-  LINKEDIN PROFILE EXTRACT
-  Extracted: 2/24/2026, 10:30:00 AM
-  Source: https://www.linkedin.com/in/johndoe/
-════════════════════════════════════════════════════════════
-
-════════════════════════════════════════════════════════════
-  PERSONAL INFORMATION
-════════════════════════════════════════════════════════════
-  Name: John Doe
-  Headline: Software Engineer at Acme Corp
-  Location: Singapore
-
-════════════════════════════════════════════════════════════
-  LICENSES & CERTIFICATIONS
-════════════════════════════════════════════════════════════
-
-  ▸ Certification 1
-  ──────────────────────────────────────────────────
-  Name: AWS Certified Solutions Architect
-  Issuer: Amazon Web Services
-  Issued: Issued Jan 2024
-  Credential ID: ABC123XYZ
-```
+Skill lists cut short on an entry ("Swift, iOS Development, +2 skills") are filled in from the Skills page.
 
 ---
 
@@ -60,29 +41,21 @@ Extract any LinkedIn profile into a clean, structured `.txt` file with one click
 2. Open Chrome → go to `chrome://extensions/`
 3. Enable **Developer Mode** (top-right toggle)
 4. Click **"Load unpacked"**
-5. Select the `linkedin-extractor` folder
+5. Select this folder
 
-The extension icon will appear in your toolbar.
+After pulling a new version, click the reload ↻ icon on the extension card **and reload any open LinkedIn tabs**.
 
 ---
 
 ## How to Use
 
-1. Go to any LinkedIn profile: `linkedin.com/in/username`
-2. **Scroll through the full profile** so LinkedIn's lazy-loader renders all sections
-3. Click the extension icon in your toolbar
-4. Click **"EXTRACT & DOWNLOAD"**
-5. A `.txt` file is saved automatically (named `firstname-lastname_YYYY-MM-DD.txt`)
-6. Use **Preview** to see the output in the popup, or **Copy Text** to copy to clipboard
+1. Sign in to LinkedIn and open any profile: `linkedin.com/in/username` (a `/details/…` page of that profile works too)
+2. Click the extension icon → **EXTRACT FULL PROFILE**
+3. An overlay appears on the tab and loads each section's page in turn. **Keep the tab in front** until it finishes, usually 1–2 minutes. LinkedIn only loads more entries while the page is visible, so the extractor pauses if you switch tabs.
+4. When it finishes, `firstname-lastname_YYYY-MM-DD.txt` downloads automatically
+5. Reopen the popup any time to download the last extract again as **.TXT** or **.JSON**, preview it, or copy it
 
----
-
-## Tips for Best Results
-
-- **Scroll the full page first** — LinkedIn lazy-loads sections as you scroll
-- Click **"Show all"** on Experience, Education, and Skills sections to reveal hidden entries
-- For Recommendations, click the "Received" tab to load them
-- Works on both your own profile and other people's public profiles
+You can close the popup while it runs; the extraction continues on the page. **Cancel** in the overlay stops it.
 
 ---
 
@@ -91,13 +64,11 @@ The extension icon will appear in your toolbar.
 ```
 linkedin-extractor/
 ├── manifest.json      # Chrome Extension manifest (v3)
-├── content.js         # Page scraper — runs on linkedin.com/in/*
+├── content.js         # Scraper — runs on linkedin.com/in/*, drives the overlay
+├── background.js      # Service worker — saves the .txt / .json download
 ├── popup.html         # Extension popup UI
-├── popup.js           # Popup logic, messaging, file download
+├── popup.js           # Popup logic: start, progress, download buttons
 ├── icons/
-│   ├── icon16.png
-│   ├── icon48.png
-│   └── icon128.png
 └── README.md
 ```
 
@@ -105,10 +76,11 @@ linkedin-extractor/
 
 ## Permissions Used
 
-| Permission    | Why                                               |
-|---------------|---------------------------------------------------|
-| `activeTab`   | Read the current LinkedIn tab                     |
-| `scripting`   | Inject content.js to scrape the page              |
-| `downloads`   | Save the extracted `.txt` file to your computer   |
+| Permission    | Why                                                         |
+|---------------|-------------------------------------------------------------|
+| `activeTab`   | Read the current LinkedIn tab                               |
+| `scripting`   | Inject content.js into tabs opened before the extension     |
+| `downloads`   | Save the extracted `.txt` / `.json` file                    |
+| `storage`     | Keep the last extract so the popup can re-download it       |
 
-No data is sent anywhere, everything runs locally in your browser.
+No data is sent anywhere. Everything runs locally in your browser.
